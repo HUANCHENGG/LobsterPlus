@@ -1,0 +1,26 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 19260,
+
+  "_comment_l1": "LobsterAI 数据目录（探测上游 baseUrl/apiKey 用，支持环境变量）",
+  "lobster_data_dir": "%APPDATA%\\LobsterAI",
+
+  "default_model": "deepseek-flash",
+  "emit_thinking": false,
+  "max_tokens_cap": 100000,
+  "request_timeout": 330,
+  "log_requests": true,
+  "probe_recheck_seconds": 60,
+
+  "_comment_l2": "代理自身鉴权（Bearer）。留空 = 不校验（仅监听 127.0.0.1）。注册 CC-Switch 时会带上。",
+  "api_key": "",
+
+  "_comment_l3": "模型名映射：claude-* 前缀 → 上游真实模型 ID。上游存在的 ID 自动直通。",
+  "models": {
+    "deepseek-flash": { "id": "deepseek-flash", "context_window": 1000000, "max_tokens": 100000 },
+    "glm-5.3": { "id": "glm-5.3", "context_window": 1000000, "max_tokens": 100000 },
+    "claude-opus-4-8": { "id": "glm-5.3", "context_window": 1000000, "max_tokens": 100000 },
+    "claude-sonnet-4-6": { "id": "deepseek-flash", "context_window": 1000000, "max_tokens": 100000 },
+    "claude-haiku-4-5": { "id": "deepseek-flash", "context_window": 1000000, "max_tokens": 100000 }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "lobster-plus 默认权限（settings 模态在主窗口内，无需额外窗口授权）",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:default"
+  ]
+}

@@ -1,0 +1,113 @@
+export const en = {
+  // Title & status
+  appTitle: "LobsterPlus",
+  appSub: "LobsterAI multi-account switcher",
+  chipLobsterOn: "LobsterAI running",
+  chipLobsterOff: "LobsterAI not running",
+  chipLoggedIn: "Logged in",
+  chipLoggedOut: "Logged out",
+  chipProxyOn: "API proxy running",
+  chipProxyOff: "API proxy off",
+  chipUpstreamOk: "Upstream detected",
+  chipUpstreamDown: "Upstream unavailable",
+
+  // Toolbar
+  captureCurrent: "Capture current login",
+  addNewAccount: "Add new account",
+  launchLobster: "Open LobsterAI",
+  closeLobster: "Close LobsterAI",
+  checkinAll: "Check in all",
+
+  // Proxy card
+  proxyTitle: "Local API stabilizer proxy",
+  proxyDesc: "Forwards the LobsterAI local model service on a fixed port (the rotating port/key pain point is fully hidden).",
+  proxyOpenaiUrl: "OpenAI",
+  proxyAnthropicUrl: "Anthropic",
+  proxyUpstream: "Upstream",
+  proxyStart: "Start proxy",
+  proxyStop: "Stop proxy",
+  proxyLog: "Log",
+  registerBtn: "Register into CC-Switch",
+  registerBtnDone: "Registered in CC-Switch",
+
+  // Account cards
+  currentTag: "Current",
+  healthOk: "Token OK",
+  healthWarn: "Expiring soon",
+  healthExpired: "Expired",
+  healthUnknown: "Health unknown",
+  healthHintOk: "Token valid for {days} days",
+  healthHintExpired: "Token expired; log in inside LobsterAI and re-capture",
+  healthHintWarn: "Token valid for {days} days; switch back to renew",
+  healthHintUnknown: "Cannot parse expiry",
+  cardMeta: "Captured {created} · Last used {updated}",
+  snapshotSize: "snapshot {size}",
+  snapshotMissing: "snapshot missing",
+  checkinOk: "Checked in today",
+  checkinMiss: "Not checked in today",
+  checkinNone: "No check-in record",
+  btnSwitch: "Switch to this account",
+  btnCheckin: "Check in",
+  btnRename: "Rename",
+  btnDelete: "Delete",
+
+  // Empty state
+  emptyTitle: "No accounts yet",
+  emptyLine1: "Log in inside LobsterAI, then click \"Capture current login\" above.",
+  emptyLine2: "Log in to other accounts and repeat to switch between them.",
+  emptyLine3: "Chat history is preserved with directory snapshots; switching never loses records.",
+
+  // Confirm dialogs
+  confirmSwitchTitle: "Switch to \"{name}\"?",
+  confirmSwitchDesc: "Running LobsterAI will be closed (finish unsaved chats first), then reopened after the directory-snapshot swap. Chat history and login state are fully isolated per account.",
+  confirmKillTitle: "Close LobsterAI?",
+  confirmKillDesc: "Adding an account requires closing LobsterAI and logging in again.",
+  confirmCaptureTitle: "Capture current login?",
+  confirmCaptureDesc: "Running LobsterAI will be closed gracefully first so the latest data is flushed to disk, then reopened after capture.",
+  confirmDeleteTitle: "Delete account \"{name}\"?",
+  confirmDeleteDesc: "Removes the LobsterPlus snapshot (including the directory snapshot with chat history). Live data is untouched.",
+  commonCancel: "Cancel",
+  commonOk: "OK",
+  commonClose: "Close",
+
+  // Add-account wizard
+  wizTitle: "Add new account",
+  wizStep1: "1. After clicking Continue, LobsterPlus closes and reopens LobsterAI.",
+  wizStep2: "2. Inside LobsterAI, <b>log out</b> and log in to the new account.",
+  wizStep3: "3. Once logged in, come back and click \"Logged in - capture this account\".",
+  wizGo: "Continue (close LobsterAI)",
+  wizCapture: "Logged in - capture this account",
+  wizCancel: "Cancel",
+  wizWaiting: "LobsterAI is open. Complete login, then click the button below.",
+
+  // Rename dialog
+  renameTitle: "Rename account",
+  renamePlaceholder: "Enter new name",
+
+  // Settings
+  setTitle: "Settings",
+  setPathLabel: "LobsterAI executable path",
+  setPathPlaceholder: "Full path of LobsterAI.exe",
+  setPathPick: "Browse",
+  setPathHint: "Leave empty to auto-detect (from running LobsterAI or common install paths).",
+  setLaunchLabel: "Launch LobsterAI after switching",
+  setAutostartLabel: "Start the API proxy when LobsterPlus starts",
+  setLangLabel: "Language",
+  setSave: "Save",
+  setSaved: "Settings saved",
+
+  // Toasts
+  captured: "Captured account \"{name}\"",
+  switched: "Switched to \"{name}\"",
+  switchAlready: "\"{name}\" is already the current account",
+  switchedLaunched: "Switched and reopened LobsterAI",
+  killed: "LobsterAI closed",
+  renamed: "Renamed",
+  deleted: "Account deleted",
+  launched: "LobsterAI launched",
+  langChanged: "Language switched",
+  checkinDone: "Check-in done: OK {ok} · already {done} · failed {err}",
+  proxyStarted: "Proxy started (port {port})",
+  proxyStopped: "Proxy stopped",
+  registered: "Registered into CC-Switch (Base URL: {url})",
+};

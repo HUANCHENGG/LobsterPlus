@@ -1,0 +1,113 @@
+export const zh = {
+  // 标题与状态
+  appTitle: "LobsterPlus",
+  appSub: "LobsterAI 多账号切换器",
+  chipLobsterOn: "LobsterAI 运行中",
+  chipLobsterOff: "LobsterAI 未运行",
+  chipLoggedIn: "已登录",
+  chipLoggedOut: "未登录",
+  chipProxyOn: "API 代理运行中",
+  chipProxyOff: "API 代理未运行",
+  chipUpstreamOk: "上游已探测",
+  chipUpstreamDown: "上游不可用",
+
+  // 工具栏
+  captureCurrent: "收编当前登录",
+  addNewAccount: "添加新账号",
+  launchLobster: "打开 LobsterAI",
+  closeLobster: "关闭 LobsterAI",
+  checkinAll: "全部签到",
+
+  // 代理卡片
+  proxyTitle: "本地 API 稳定代理",
+  proxyDesc: "固定端口转发 LobsterAI 本地模型服务（端口/key 随重启轮换的痛点被彻底屏蔽）。",
+  proxyOpenaiUrl: "OpenAI",
+  proxyAnthropicUrl: "Anthropic",
+  proxyUpstream: "上游",
+  proxyStart: "启动代理",
+  proxyStop: "停止代理",
+  proxyLog: "日志",
+  registerBtn: "注册进 CC-Switch",
+  registerBtnDone: "已注册进 CC-Switch",
+
+  // 账号卡片
+  currentTag: "当前",
+  healthOk: "token 健康",
+  healthWarn: "即将过期",
+  healthExpired: "已过期",
+  healthUnknown: "健康度未知",
+  healthHintOk: "token 剩余 {days} 天",
+  healthHintExpired: "token 已过期，切回此账号需在客户端重新登录",
+  healthHintWarn: "token 剩余 {days} 天，建议切回此账号激活续期",
+  healthHintUnknown: "无法解析有效期",
+  cardMeta: "收编于 {created} · 最近使用 {updated}",
+  snapshotSize: "快照 {size}",
+  snapshotMissing: "快照缺失",
+  checkinOk: "今日已签",
+  checkinMiss: "今日未签",
+  checkinNone: "未签到",
+  btnSwitch: "切换到此账号",
+  btnCheckin: "签到",
+  btnRename: "重命名",
+  btnDelete: "删除",
+
+  // 空状态
+  emptyTitle: "还没有账号",
+  emptyLine1: "在 LobsterAI 中登录后，点击上方「收编当前登录」保存第一个账号。",
+  emptyLine2: "之后登录其他账号并重复收编，即可在账号间一键切换。",
+  emptyLine3: "对话记录随目录快照整体保留，切换不会丢失任何记录。",
+
+  // 确认弹窗
+  confirmSwitchTitle: "切换到「{name}」？",
+  confirmSwitchDesc: "将关闭正在运行的 LobsterAI（未保存的对话请先处理），目录快照交换后自动重新打开。各账号的对话记录与登录态完全隔离。",
+  confirmKillTitle: "关闭 LobsterAI？",
+  confirmKillDesc: "添加新账号需要先关闭 LobsterAI 并重新登录。",
+  confirmCaptureTitle: "收编当前登录？",
+  confirmCaptureDesc: "将先优雅关闭正在运行的 LobsterAI 以读取最新数据（WAL 落盘），收编完成后自动重新打开。",
+  confirmDeleteTitle: "删除账号「{name}」？",
+  confirmDeleteDesc: "删除 LobsterPlus 中的账号快照（含目录快照与对话记录副本）。当前 live 数据不受影响。",
+  commonCancel: "取消",
+  commonOk: "确定",
+  commonClose: "关闭",
+
+  // 添加账号向导
+  wizTitle: "添加新账号",
+  wizStep1: "1. 点击「继续」后，LobsterPlus 会关闭并重新打开 LobsterAI。",
+  wizStep2: "2. 在 LobsterAI 里<b>退出当前账号</b>，登录你要添加的新账号。",
+  wizStep3: "3. 登录成功后回到本窗口，点击「已登录，收编此账号」。",
+  wizGo: "继续（关闭 LobsterAI）",
+  wizCapture: "已登录，收编此账号",
+  wizCancel: "取消",
+  wizWaiting: "LobsterAI 已打开。完成登录后点击下方按钮收编。",
+
+  // 重命名弹窗
+  renameTitle: "重命名账号",
+  renamePlaceholder: "输入新名称",
+
+  // 设置
+  setTitle: "设置",
+  setPathLabel: "LobsterAI 主程序路径",
+  setPathPlaceholder: "LobsterAI.exe 的完整路径",
+  setPathPick: "浏览",
+  setPathHint: "留空将自动探测（从运行中的 LobsterAI 或常见安装路径）。",
+  setLaunchLabel: "切换后自动启动 LobsterAI",
+  setAutostartLabel: "启动 LobsterPlus 时自动启动 API 代理",
+  setLangLabel: "界面语言 / Language",
+  setSave: "保存",
+  setSaved: "设置已保存",
+
+  // toast
+  captured: "已收编账号「{name}」",
+  switched: "已切换到「{name}」",
+  switchAlready: "「{name}」已是当前账号",
+  switchedLaunched: "已切换并重新打开 LobsterAI",
+  killed: "LobsterAI 已关闭",
+  renamed: "已重命名",
+  deleted: "账号已删除",
+  launched: "LobsterAI 已启动",
+  langChanged: "语言已切换",
+  checkinDone: "签到完成：成功 {ok} · 已签 {done} · 失败 {err}",
+  proxyStarted: "代理已启动（端口 {port}）",
+  proxyStopped: "代理已停止",
+  registered: "已注册进 CC-Switch（Base URL: {url}）",
+};

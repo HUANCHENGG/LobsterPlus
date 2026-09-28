@@ -1,0 +1,58 @@
+[package]
+name = "lobster-plus"
+version = "0.1.0"
+description = "LobsterAI 多账号切换器"
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "lobster_plus_lib"
+# 只留 rlib：cdylib 会被 MinGW 链成 DLL（本项目从不使用该产物），
+# 且引入 ureq/rustls 后导出符号数超出 ld 的 65535 上限（export ordinal too large）。
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [], optional = true }
+
+[features]
+default = ["gui"]
+# GUI 层（tauri 命令层 + Builder）。单测用 --no-default-features 只编译纯逻辑
+# 模块：本机 Windows Server 17763 上链接了 wry/webview2 的测试二进制会在进程
+# 冷启动时报 STATUS_ENTRYPOINT_NOT_FOUND（WebView2Loader 链），纯逻辑测试
+# 无需 GUI 依赖。
+gui = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-single-instance", "dep:tauri-build"]
+
+[dependencies]
+# 固定 tauri 2.11.x：对齐 TraePlus 已实机验证的依赖树（2.12 引入的
+# webview2-com-sys 0.39 在本机 Windows Server 17763 上测试 exe 报
+# STATUS_ENTRYPOINT_NOT_FOUND，0.38.2 正常）
+tauri = { version = "=2.11.6", features = [], optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+aes-gcm = "0.10"
+base64 = "0.22"
+sysinfo = "0.33"
+sys-locale = "0.3"
+# 签到/token 续期/代理健康探测用；tls 走 rustls，避免依赖本机 OpenSSL
+ureq = { version = "2", features = ["tls"] }
+# 读写 lobsterai.sqlite kv 表 + cc-switch.db 注册 provider
+# bundled：sqlite3.c 源码级编译进二进制（本机 Windows 10 无系统 sqlite3.dll，
+# mingw64 也无 libsqlite3）。编译坑：本机 mingw64 的 time.h 会引
+# pthread_time.h 而该头文件缺失——build.rs 给 cc 传 CFLAGS=-D_STRICT_STDC
+# 绕过（已实测：该宏下 time/localtime 等时间函数全部可用）。
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
