@@ -20,5 +20,10 @@ fn main() {
     // tauri_build 只在 GUI feature 下需要（无 GUI 时不必解析 tauri.conf.json /
     // 嵌入图标，纯逻辑测试编译更快）
     #[cfg(feature = "gui")]
-    tauri_build::build()
+    {
+        // 图标文件变化必须触发资源段重编（embed-resource 在 build script 里
+        // 执行；只改 icons/*.ico 而不动 conf 时 cargo 不会重跑本脚本）
+        println!("cargo:rerun-if-changed=icons");
+        tauri_build::build()
+    }
 }
