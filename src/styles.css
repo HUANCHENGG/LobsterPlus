@@ -36,7 +36,7 @@ body {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 10px; transition: opacity 0.2s;
 }
-.splash-logo { font-size: 44px; }
+.splash-logo { width: 44px; height: 44px; border-radius: 10px; }
 .splash-title { color: var(--muted); letter-spacing: 2px; }
 
 /* ---------- header ---------- */
@@ -44,7 +44,7 @@ body {
   display: flex; align-items: center; gap: 10px;
   padding: 14px 18px 10px;
 }
-.h-logo { font-size: 22px; line-height: 1; }
+.h-logo { width: 22px; height: 22px; border-radius: 6px; }
 .h-title { font-size: 17px; font-weight: 600; }
 .h-sub { color: var(--muted); font-size: 12px; margin-left: 2px; }
 .h-spacer { flex: 1; }
@@ -159,7 +159,7 @@ body {
   border: 1px dashed var(--line); border-radius: var(--radius);
   padding: 40px 20px; text-align: center; color: var(--muted);
 }
-.empty .big { font-size: 48px; margin-bottom: 10px; }
+.empty .big { width: 56px; height: 56px; border-radius: 12px; margin-bottom: 10px; }
 .empty p { margin: 4px 0; }
 
 /* ---------- toast ---------- */

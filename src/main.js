@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openConfirmModal, openInputModal, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, lang } from "./i18n.js";
+import lobsterLogo from "./assets/lobster-logo.png";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -141,7 +142,7 @@ function render() {
   const empty =
     state.accounts.length === 0
       ? `<div class="empty">
-          <div class="big">🦞</div>
+          <img class="big" src="${lobsterLogo}" alt="" />
           <p><b>${t("emptyTitle")}</b></p>
           <p>${t("emptyLine1")}</p>
           <p>${t("emptyLine2")}</p>
@@ -151,7 +152,7 @@ function render() {
 
   $app.innerHTML = `
     <div class="header">
-      <span class="h-logo">🦞</span>
+      <img class="h-logo" src="${lobsterLogo}" alt="" />
       <span class="h-title">${t("appTitle")}</span>
       <span class="h-sub">${t("appSub")}</span>
       <span class="h-spacer"></span>
