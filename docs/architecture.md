@@ -136,7 +136,7 @@ token 策略：
 
 - 本机固定 GNU 工具链（MSVC 残缺）：`scripts\build-release.cmd`（PATH 前置 `D:\mingw64\bin` + `--features tauri/custom-protocol` 嵌入前端）。
 - `[lib]` 只留 `rlib`（cdylib 超 MinGW ld 65535 符号上限）。
-- 单测：`cargo test --manifest-path src-tauri\Cargo.toml`（manifest 交换/kvdb/zcrypto/lockfile/proxy 内嵌）。
+- 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（manifest 交换/kvdb/zcrypto/lockfile/proxy 内嵌；gui 层不进测试二进制）。
 
 ## 六、E2E 验收清单
 

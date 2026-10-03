@@ -8,7 +8,7 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 1. **本机必须走 GNU 工具链**（MSVC 链接环境残缺）：release 构建一律用 `scripts\build-release.cmd`（内部前置 `PATH=D:\mingw64\bin` 并带 `--features tauri/custom-protocol` 嵌入前端）。直接 `cargo build --release` 不带 custom-protocol 会产出连 127.0.0.1:5177 的废 exe。
 2. **`[lib]` 只留 `rlib`**：cdylib 会被 MinGW 链成 DLL 且 ureq/rustls 导出符号超 ld 65535 上限（家族教训）。
 3. 前端先 `npm install`（package-lock 未提交前）。开发：`npm run tauri dev`。
-4. 单测：`cargo test --manifest-path src-tauri\Cargo.toml`。
+4. 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（gui 层不进测试二进制，理由见踩坑 3）。
 
 ## 模块地图
 
@@ -24,6 +24,7 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 | `zcrypto.rs` | enc:v1 AES-256-GCM | AAD=`lobster-plus:v1`（注意与家族前作不同） |
 | `lockfile.rs` | ProxyLock 跨进程锁 | 锁超时 30s/陈旧 180s（目录拷贝耗时长） |
 | `cli.rs` | CLI 镜像 + doctor + schtasks | `--cli` 前缀分流（main.rs） |
+| `app.rs` | Tauri GUI 命令层 | `gui` feature 门控；CLI 与单测编译不含此模块 |
 
 ## 数据契约
 
