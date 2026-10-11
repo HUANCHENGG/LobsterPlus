@@ -106,8 +106,12 @@ token 策略：
 
 **稳定器**（UpstreamManager，替换 raccoon 的 AuthManager）：
 - 候选 = models.json 与 openclaw.json 两处 `(baseUrl, apiKey)`；
-- 探活 = TCP 可连 + `GET /v1/models` 鉴权通过；
-- 缓存 60s；请求失败自动 force 重探测；全挂返回 503（LobsterAI 未运行）。
+- 探活 = TCP 可连 + 最小 `POST /v1/chat/completions` 确认端点存在（上游无 `/v1/models`，HTTP 错误响应也表示服务在线）；
+- 缓存 60s；连接失败自动 force 重探测并重试一次；全挂返回 503（LobsterAI 未运行）。
+
+**Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上下游 usage 同时给出输入/输出 token，`estimated` 表示缺失时按本地规则估算（当前实际采集路径使用这两类），`missing` 为无法取得或估算时的保留口径。
+
+Rust `proxy_usage(range)` 只读该库并校验 schema，范围仅支持 `today`、`7d`、`30d`、`all`，返回总计、按日和按模型汇总；不负责采集。前端入口在代理卡片的“今日用量”摘要及“用量详情”按钮，详情可切换上述范围。
 
 **端点**（监听 127.0.0.1:19260，config 可改）：
 
@@ -136,7 +140,8 @@ token 策略：
 
 - 本机固定 GNU 工具链（MSVC 残缺）：`scripts\build-release.cmd`（PATH 前置 `D:\mingw64\bin` + `--features tauri/custom-protocol` 嵌入前端）。
 - `[lib]` 只留 `rlib`（cdylib 超 MinGW ld 65535 符号上限）。
-- 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（manifest 交换/kvdb/zcrypto/lockfile/proxy 内嵌；gui 层不进测试二进制）。
+- 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（含 Rust usage 只读查询；gui 层不进测试二进制）。
+- Python 用量存储自检（不访问真实上游）：`python src-tauri\proxy\lobster_proxy.py --selftest-storage`（schema/v1 迁移/WAL/聚合/失败/并发写入）。
 
 ## 六、E2E 验收清单
 

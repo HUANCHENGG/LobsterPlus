@@ -30,7 +30,9 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -41,6 +43,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
+USAGE_DB_PATH = os.path.join(HERE, "usage.sqlite")
+USAGE_SCHEMA_VERSION = 2
 
 DEFAULT_CONFIG = {
     "listen_host": "127.0.0.1",
@@ -88,6 +92,177 @@ def load_config():
 
 
 CONFIG = load_config()
+
+
+# --------------------------------------------------------------------------
+# 用量统计（仅保存按日聚合，不保存请求内容或密钥）
+# --------------------------------------------------------------------------
+
+class UsageStore(object):
+    """SQLite 按日聚合统计；每次写入使用独立连接和单条 UPSERT 短事务。"""
+
+    COLUMNS = ("day", "protocol", "model", "input", "output", "request",
+               "success", "error", "accurate", "estimated", "missing")
+
+    def __init__(self, path=USAGE_DB_PATH):
+        self.path = path
+        self._init_lock = threading.Lock()
+        self._ready = False
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    @staticmethod
+    def _is_busy(exc):
+        text = str(exc).lower()
+        return "locked" in text or "busy" in text
+
+    def _retry(self, operation):
+        for attempt in range(4):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                if not self._is_busy(e) or attempt == 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+
+    @staticmethod
+    def _table_exists(conn, name):
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone() is not None
+
+    def _validate_schema(self, conn):
+        rows = conn.execute("PRAGMA table_info(usage_daily)").fetchall()
+        columns = tuple(row[1] for row in rows)
+        primary = tuple(row[1] for row in sorted(rows, key=lambda row: row[5]) if row[5])
+        if columns != self.COLUMNS or primary != ("day", "protocol", "model"):
+            raise RuntimeError("usage_daily schema 不兼容: columns=%r pk=%r" %
+                               (columns, primary))
+
+    def _initialize_once(self):
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS usage_daily (
+                    day TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input INTEGER NOT NULL DEFAULT 0,
+                    output INTEGER NOT NULL DEFAULT 0,
+                    request INTEGER NOT NULL DEFAULT 0,
+                    success INTEGER NOT NULL DEFAULT 0,
+                    error INTEGER NOT NULL DEFAULT 0,
+                    accurate INTEGER NOT NULL DEFAULT 0,
+                    estimated INTEGER NOT NULL DEFAULT 0,
+                    missing INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, protocol, model)
+                )
+            """)
+            self._validate_schema(conn)
+            if self._table_exists(conn, "daily_usage"):
+                conn.execute("""
+                    INSERT INTO usage_daily
+                        (day, protocol, model, input, output, request, success,
+                         error, accurate, estimated, missing)
+                    SELECT day, protocol, model,
+                           SUM(input_tokens), SUM(output_tokens), SUM(requests),
+                           SUM(successes), SUM(failures),
+                           SUM(CASE WHEN source = 'upstream' THEN requests ELSE 0 END),
+                           SUM(CASE WHEN source = 'estimated' THEN requests ELSE 0 END),
+                           SUM(CASE WHEN source NOT IN ('upstream', 'estimated')
+                                    THEN requests ELSE 0 END)
+                    FROM daily_usage GROUP BY day, protocol, model
+                    ON CONFLICT(day, protocol, model) DO UPDATE SET
+                        input = input + excluded.input,
+                        output = output + excluded.output,
+                        request = request + excluded.request,
+                        success = success + excluded.success,
+                        error = error + excluded.error,
+                        accurate = accurate + excluded.accurate,
+                        estimated = estimated + excluded.estimated,
+                        missing = missing + excluded.missing
+                """)
+                conn.execute("DROP TABLE daily_usage")
+            conn.execute("PRAGMA user_version=%d" % USAGE_SCHEMA_VERSION)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def initialize(self):
+        if self._ready:
+            return
+        with self._init_lock:
+            if self._ready:
+                return
+            self._retry(self._initialize_once)
+            self._ready = True
+
+    def record(self, protocol, model, success, input_tokens, output_tokens, source,
+               day=None):
+        self.initialize()
+        day = day or time.strftime("%Y-%m-%d", time.localtime())
+        source = source if source in ("accurate", "estimated", "missing") else "missing"
+        source_counts = [1 if source == name else 0
+                         for name in ("accurate", "estimated", "missing")]
+        values = (day, str(protocol or "unknown"), str(model or "unknown"),
+                  max(0, int(input_tokens or 0)), max(0, int(output_tokens or 0)),
+                  1, 1 if success else 0, 0 if success else 1) + tuple(source_counts)
+
+        def write_once():
+            conn = self._connect()
+            try:
+                conn.execute("""
+                    INSERT INTO usage_daily
+                        (day, protocol, model, input, output, request, success,
+                         error, accurate, estimated, missing)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(day, protocol, model) DO UPDATE SET
+                        input = input + excluded.input,
+                        output = output + excluded.output,
+                        request = request + excluded.request,
+                        success = success + excluded.success,
+                        error = error + excluded.error,
+                        accurate = accurate + excluded.accurate,
+                        estimated = estimated + excluded.estimated,
+                        missing = missing + excluded.missing
+                """, values)
+                conn.commit()
+            finally:
+                conn.close()
+
+        self._retry(write_once)
+
+
+USAGE = UsageStore()
+
+
+def _safe_record_usage(protocol, model, success, input_tokens=0, output_tokens=0,
+                       source="estimated"):
+    """统计失败不得影响转发。"""
+    try:
+        USAGE.record(protocol, model, success, input_tokens, output_tokens, source)
+    except Exception as e:
+        log("警告: 用量统计写入失败 (%s)" % e)
+
+
+def _usage_values(usage, fallback_input=0, fallback_output=0):
+    """提取 OpenAI usage；任一 token 字段缺失时整体按估算标记。"""
+    usage = usage if isinstance(usage, dict) else {}
+    has_exact = (usage.get("prompt_tokens") is not None
+                 and usage.get("completion_tokens") is not None)
+    if has_exact:
+        return (max(0, int(usage.get("prompt_tokens") or 0)),
+                max(0, int(usage.get("completion_tokens") or 0)), "accurate")
+    return (max(0, int(fallback_input or 0)),
+            max(0, int(fallback_output or 0)), "estimated")
 
 
 # --------------------------------------------------------------------------
@@ -695,6 +870,7 @@ class AnthropicStreamEmitter(object):
         self.tool_names = {}
         self.finish_reason = None
         self.output_tokens = 0
+        self.usage_received = False
 
     def _ev(self, event, data):
         return "event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))
@@ -809,6 +985,9 @@ class AnthropicStreamEmitter(object):
         return "".join(out)
 
     def _absorb_usage(self, usage):
+        if (usage.get("prompt_tokens") is not None
+                and usage.get("completion_tokens") is not None):
+            self.usage_received = True
         if usage.get("completion_tokens"):
             self.output_tokens = usage["completion_tokens"]
         if usage.get("prompt_tokens"):
@@ -986,6 +1165,10 @@ class Handler(BaseHTTPRequestHandler):
         # 强制走流式再聚合（保持请求语义）。客户端要流式则照常透传。
         client_stream = bool(body.get("stream"))
         body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+        model_id = body.get("model") or "unknown"
+        est_in = _estimate_tokens(body.get("messages")) + \
+            _estimate_tokens(body.get("tools"))
         if CONFIG.get("log_requests"):
             log("-> [openai] model=%s stream=%s msgs=%d" % (
                 body.get("model"), client_stream, len(body.get("messages") or [])))
@@ -993,17 +1176,19 @@ class Handler(BaseHTTPRequestHandler):
             resp = self._upstream_with_retry(body)
         except urllib.error.HTTPError as e:
             status, text = upstream_error_text(e)
+            _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
             self._send_json(status or 502, {"error": {"message": "上游错误(%s): %s" % (status, str(text)[:500]),
                                                       "type": "api_error"}})
             return
         except Exception as e:
+            _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
             self._send_json(502, {"error": {"message": "无法连接上游: %s" % e,
                                              "type": "api_error"}})
             return
         if client_stream:
-            self._pipe_stream(resp)
+            self._pipe_stream(resp, model_id, est_in)
         else:
-            self._pipe_flat(resp)
+            self._pipe_flat(resp, model_id, est_in)
 
     def _upstream_with_retry(self, payload):
         """调上游；连接类失败（端口轮换）强制重探测一次再试。"""
@@ -1015,22 +1200,53 @@ class Handler(BaseHTTPRequestHandler):
             log("上游调用失败(%s)，重探测后重试一次" % e)
             return call_upstream(payload, force_probe=True)
 
-    def _pipe_stream(self, resp):
-        """把上游 SSE 原样转发（chunked）。"""
+    def _pipe_stream(self, resp, model_id, est_in):
+        """把上游 SSE 原样转发（chunked），旁路解析 usage 后记账。"""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        usage = {}
+        output_parts = []
+        success = True
+        valid_response = False
+        normal_end = False
+        sse_buf = ""
         try:
             while True:
                 block = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
                 if not block:
                     break
-                if not self._write_chunk(block.decode("utf-8", "replace")):
-                    return
+                text = block.decode("utf-8", "replace")
+                sse_buf += text
+                lines = sse_buf.split("\n")
+                sse_buf = lines.pop()
+                for line in lines:
+                    if line.strip() == "data: [DONE]":
+                        normal_end = True
+                    chunk = self._parse_sse_chunk(line)
+                    if chunk:
+                        if self._openai_business_error(chunk):
+                            success = False
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            valid_response = True
+                            if choices[0].get("finish_reason") is not None:
+                                normal_end = True
+                            delta = choices[0].get("delta") or {}
+                            output_parts.append(delta.get("content") or "")
+                            output_parts.append(delta.get("reasoning_content") or "")
+                            output_parts.extend(json.dumps(tc, ensure_ascii=False)
+                                                for tc in delta.get("tool_calls") or [])
+                if not self._write_chunk(text):
+                    success = False
+                    break
         except Exception as e:
+            success = False
             log("透传出错: %s" % e)
         finally:
             try:
@@ -1038,8 +1254,34 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             self._end_chunked()
+            success = success and valid_response and normal_end
+            est_out = _estimate_tokens("".join(output_parts))
+            inp, out, source = _usage_values(usage, est_in, est_out)
+            _safe_record_usage("openai", model_id, success, inp, out, source)
 
-    def _pipe_flat(self, resp):
+    @staticmethod
+    def _openai_business_error(obj):
+        if not isinstance(obj, dict):
+            return True
+        if obj.get("error"):
+            return True
+        return obj.get("code") not in (None, 0, "0") and not obj.get("choices")
+
+    @staticmethod
+    def _parse_sse_chunk(line):
+        line = line.strip()
+        if not line.startswith("data:"):
+            return None
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            return None
+        try:
+            chunk = json.loads(data)
+            return chunk if isinstance(chunk, dict) else None
+        except Exception:
+            return None
+
+    def _pipe_flat(self, resp, model_id, est_in):
         """非流式转发。实测上游（lobsterai-model-compat）对 stream:false 也
         强制返回 SSE 流（content-type: text/event-stream），所以这里统一按
         SSE 读入并聚合成标准 OpenAI 非流式响应。"""
@@ -1059,6 +1301,13 @@ class Handler(BaseHTTPRequestHandler):
         if "text/event-stream" in ctype or text.lstrip().startswith("data:"):
             oa = self._aggregate_sse(text)
             if oa is not None:
+                business_error = self._openai_business_error(oa)
+                usage = oa.get("usage") or {}
+                message = ((oa.get("choices") or [{}])[0].get("message") or {})
+                est_out = _estimate_tokens(message)
+                inp, out, source = _usage_values(usage, est_in, est_out)
+                _safe_record_usage("openai", model_id, not business_error,
+                                   inp, out, source)
                 payload = json.dumps(oa, ensure_ascii=False).encode("utf-8")
                 try:
                     self.send_response(200)
@@ -1069,7 +1318,17 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
-        # 真非流式（未来上游修复后）：原样转发
+        # 真非流式（未来上游修复后）：解析统计后原样转发
+        try:
+            oa = json.loads(text)
+            usage = oa.get("usage") or {}
+            message = ((oa.get("choices") or [{}])[0].get("message") or {})
+            est_out = _estimate_tokens(message)
+            inp, out, source = _usage_values(usage, est_in, est_out)
+            _safe_record_usage("openai", model_id,
+                               not self._openai_business_error(oa), inp, out, source)
+        except Exception:
+            _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1181,25 +1440,28 @@ class Handler(BaseHTTPRequestHandler):
 
         # 实测上游对 stream:false 也强制回 SSE：非流式请求也走流式再聚合
         payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
 
         try:
             resp = self._upstream_with_retry(payload)
         except urllib.error.HTTPError as e:
             status, text = upstream_error_text(e)
+            _safe_record_usage("anthropic", model_id, False, est_in, 0, "estimated")
             self._send_error_anthropic(
                 status or 502, "api_error",
                 "上游返回错误(%s): %s" % (status, text[:500]))
             return
         except Exception as e:
+            _safe_record_usage("anthropic", model_id, False, est_in, 0, "estimated")
             self._send_error_anthropic(502, "api_error", "无法连接上游: %s" % e)
             return
 
         if stream:
             self._stream_response(resp, model_id, est_in)
         else:
-            self._nonstream_response(resp, model_id)
+            self._nonstream_response(resp, model_id, est_in)
 
-    def _nonstream_response(self, resp, model_id):
+    def _nonstream_response(self, resp, model_id, est_in):
         """Anthropic 非流式。实测上游对 stream:false 也回 SSE → 按 SSE 聚合
         成完整 OpenAI 响应再转 Anthropic。"""
         try:
@@ -1214,6 +1476,8 @@ class Handler(BaseHTTPRequestHandler):
             # 上游强制 SSE：聚合成完整对象
             oa = self._aggregate_sse(text)
             if oa is None:
+                _safe_record_usage("anthropic", model_id, False, est_in, 0,
+                                   "estimated")
                 self._send_error_anthropic(502, "api_error",
                                            "上游返回空流: %s" % text[:200])
                 return
@@ -1221,20 +1485,31 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 oa = json.loads(text)
             except Exception:
+                _safe_record_usage("anthropic", model_id, False, est_in, 0,
+                                   "estimated")
                 self._send_error_anthropic(502, "api_error",
                                            "上游返回非 JSON: %s" % text[:300])
                 return
-        if isinstance(oa, dict) and oa.get("code") not in (0, None) and "choices" not in oa:
+        if self._openai_business_error(oa):
+            _safe_record_usage("anthropic", model_id, False, est_in, 0,
+                               "estimated")
             self._send_error_anthropic(502, "api_error",
                                        "上游错误: %s" % str(oa)[:400])
             return
-        self._send_json(200, openai_to_anthropic_response(oa, model_id))
+        converted = openai_to_anthropic_response(oa, model_id)
+        est_out = _estimate_tokens(converted.get("content"))
+        inp, out, source = _usage_values(oa.get("usage"), est_in, est_out)
+        _safe_record_usage("anthropic", model_id, True, inp, out, source)
+        self._send_json(200, converted)
 
     def _stream_response(self, resp, model_id, est_in):
         emitter = AnthropicStreamEmitter(
             model_id, input_tokens_estimate=est_in,
             emit_thinking=bool(CONFIG.get("emit_thinking")))
         self._begin_stream()
+        success = True
+        valid_response = False
+        normal_end = False
         try:
             for line in iter_sse_lines(resp):
                 if not line or line.startswith(":"):
@@ -1245,18 +1520,29 @@ class Handler(BaseHTTPRequestHandler):
                 if not data:
                     continue
                 if data == "[DONE]":
+                    normal_end = True
                     break
                 try:
                     chunk = json.loads(data)
                 except Exception:
+                    success = False
                     continue
+                if self._openai_business_error(chunk):
+                    success = False
+                choices = chunk.get("choices") or []
+                if choices:
+                    valid_response = True
+                    if choices[0].get("finish_reason") is not None:
+                        normal_end = True
                 events = emitter.feed(chunk)
                 if events and not self._write_chunk(events):
+                    success = False
                     return
             tail = emitter.finish_events()
-            if tail:
-                self._write_chunk(tail)
+            if tail and not self._write_chunk(tail):
+                success = False
         except Exception as e:
+            success = False
             log("流式处理出错: %s" % e)
             if not emitter.finished:
                 self._write_chunk(emitter.finish_events())
@@ -1266,6 +1552,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             self._end_chunked()
+            success = success and valid_response and normal_end
+            source = "accurate" if emitter.usage_received else "estimated"
+            _safe_record_usage("anthropic", model_id, success,
+                               emitter.input_tokens or est_in,
+                               emitter.output_tokens, source)
 
     # -- POST /v1/messages/count_tokens ------------------------------------
 
@@ -1285,8 +1576,94 @@ class Handler(BaseHTTPRequestHandler):
 # 自检
 # --------------------------------------------------------------------------
 
+def usage_storage_selftest():
+    """不访问真实上游，验证最终 schema、v1 迁移、聚合及并发写入。"""
+    fd, path = tempfile.mkstemp(prefix="lobster-usage-test-", suffix=".sqlite")
+    os.close(fd)
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("""
+                CREATE TABLE daily_usage (
+                    day TEXT NOT NULL, protocol TEXT NOT NULL, model TEXT NOT NULL,
+                    source TEXT NOT NULL, requests INTEGER NOT NULL,
+                    successes INTEGER NOT NULL, failures INTEGER NOT NULL,
+                    input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                    PRIMARY KEY (day, protocol, model, source)
+                )
+            """)
+            conn.executemany("INSERT INTO daily_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                ("2000-01-01", "openai", "test-model", "upstream", 2, 2, 0, 6, 4),
+                ("2000-01-01", "openai", "test-model", "estimated", 1, 0, 1, 1, 0),
+            ])
+            conn.execute("PRAGMA user_version=1")
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = UsageStore(path)
+        store.initialize()
+        store.initialize()
+        threads = []
+        errors = []
+
+        def record_test_row():
+            try:
+                store.record("openai", "test-model", True, 3, 2, "accurate",
+                             day="2000-01-01")
+            except Exception as e:
+                errors.append(e)
+
+        for _i in range(8):
+            thread = threading.Thread(target=record_test_row)
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+        store.record("openai", "test-model", False, 1, 0, "missing",
+                     day="2000-01-01")
+        conn = sqlite3.connect(path)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            columns = tuple(row[1] for row in conn.execute(
+                "PRAGMA table_info(usage_daily)").fetchall())
+            legacy = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_usage'"
+            ).fetchone()
+            row = conn.execute("""
+                SELECT input, output, request, success, error,
+                       accurate, estimated, missing
+                FROM usage_daily WHERE day=? AND protocol=? AND model=?
+            """, ("2000-01-01", "openai", "test-model")).fetchone()
+        finally:
+            conn.close()
+        expected = (32, 20, 12, 10, 2, 10, 1, 1)
+        if (version != USAGE_SCHEMA_VERSION or mode.lower() != "wal"
+                or columns != UsageStore.COLUMNS or legacy is not None
+                or row != expected):
+            raise AssertionError(
+                "统计存储结果不符: version=%s mode=%s columns=%r legacy=%r row=%r" %
+                (version, mode, columns, legacy, row))
+        log("统计存储自检通过（最终 schema/v1 迁移/WAL/聚合/失败/并发）")
+        return 0
+    except Exception as e:
+        log("统计存储自检失败: %s" % e)
+        return 1
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+
+
 def selftest():
     log("=== 自检 ===")
+    if usage_storage_selftest():
+        return 1
     found = UPSTREAM.probe(force=True)
     if not found:
         log("上游不可用：LobsterAI 未运行或本地端口探测失败")
@@ -1320,8 +1697,20 @@ def selftest():
 # --------------------------------------------------------------------------
 
 def main():
+    if "--selftest-storage" in sys.argv:
+        try:
+            success = usage_storage_selftest() == 0
+        except BaseException as e:
+            log("统计存储自检失败（未处理异常）: %s" % e)
+            success = False
+        return 0 if success else 1
     if "--selftest" in sys.argv:
-        sys.exit(selftest())
+        try:
+            success = selftest() == 0
+        except BaseException as e:
+            log("自检失败（未处理异常）: %s" % e)
+            success = False
+        return 0 if success else 1
 
     host = CONFIG["listen_host"]
     port = int(CONFIG["listen_port"])
@@ -1355,4 +1744,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

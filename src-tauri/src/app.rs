@@ -7,6 +7,7 @@ use crate::i18n;
 use crate::proxy;
 use crate::register;
 use crate::store::{self, Paths, Settings};
+use crate::usage;
 use serde_json::{json, Value};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -135,6 +136,12 @@ fn proxy_log() -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn proxy_usage(range: String) -> Result<usage::UsageReport, String> {
+    let paths = Paths::detect();
+    usage::query(&paths.root.join("proxy").join("usage.sqlite"), &range)
+}
+
+#[tauri::command]
 fn register_ccswitch(switch_to_it: Option<bool>) -> Result<Value, String> {
     let paths = Paths::detect();
     register::register(&paths, switch_to_it.unwrap_or(false))
@@ -214,6 +221,7 @@ pub fn run() {
             proxy_start,
             proxy_stop,
             proxy_log,
+            proxy_usage,
             register_ccswitch,
             set_settings,
         ])

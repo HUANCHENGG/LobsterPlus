@@ -8,6 +8,10 @@ import lobsterLogo from "./assets/lobster-logo.png";
 const $app = document.getElementById("app");
 let state = null;
 let busy = false;
+let todayUsage = null;
+let usageModal = null;
+let usageRefreshTimer = null;
+let usageRequestSeq = 0;
 
 async function guard(fn) {
   if (busy) return;
@@ -31,6 +35,17 @@ async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
   render();
+  refreshTodayUsage();
+}
+
+async function refreshTodayUsage() {
+  try {
+    todayUsage = await invoke("proxy_usage", { range: "today" });
+    renderProxyUsageSummary();
+  } catch (_) {
+    todayUsage = null;
+    renderProxyUsageSummary();
+  }
 }
 
 function setButtonsDisabled(v) {
@@ -56,6 +71,46 @@ function fmtSize(bytes) {
   if (bytes == null) return "—";
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function usageValue(obj, ...keys) {
+  for (const key of keys) {
+    if (obj?.[key] != null && Number.isFinite(Number(obj[key]))) return Number(obj[key]);
+  }
+  return 0;
+}
+
+function usageTotals(data) {
+  const source = data?.totals || data?.total || data || {};
+  const input = usageValue(source, "input_tokens", "inputTokens", "input");
+  const output = usageValue(source, "output_tokens", "outputTokens", "output");
+  return {
+    requests: usageValue(source, "requests", "request_count", "requestCount"),
+    input,
+    output,
+    total: usageValue(source, "total_tokens", "totalTokens", "tokens") || input + output,
+    accurate: usageValue(source, "accurate_requests", "accurateRequests", "accurate"),
+    estimated: usageValue(source, "estimated_requests", "estimatedRequests", "estimated"),
+    missing: usageValue(source, "missing_requests", "missingRequests", "missing"),
+  };
+}
+
+function fmtCount(value) {
+  return new Intl.NumberFormat(lang() === "zh" ? "zh-CN" : "en-US", { maximumFractionDigits: 0 }).format(Number(value) || 0);
+}
+
+function proxyUsageSummaryHtml() {
+  if (!todayUsage) return `<span class="proxy-usage-loading">${esc(t("usageLoading"))}</span>`;
+  const total = usageTotals(todayUsage);
+  return `
+    <span><b>${fmtCount(total.requests)}</b>${esc(t("usageRequestsShort"))}</span>
+    <span><small>${esc(t("usageInputShort"))}</small><b>${fmtCount(total.input)}</b></span>
+    <span><small>${esc(t("usageOutputShort"))}</small><b>${fmtCount(total.output)}</b></span>`;
+}
+
+function renderProxyUsageSummary() {
+  const node = $app.querySelector(".proxy-usage-summary");
+  if (node) node.innerHTML = proxyUsageSummaryHtml();
 }
 
 function checkinChip(acc) {
@@ -88,11 +143,16 @@ function proxyCard() {
       <span class="proxy-url"><b>${t("proxyAnthropicUrl")}</b><code>http://127.0.0.1:${port}/v1/messages</code></span>
       <span class="proxy-url"><b>${t("proxyUpstream")}</b><code>${upstream}</code> ${running ? (upstreamOk ? `<span class="chip on"><span class="dot"></span>${t("chipUpstreamOk")}</span>` : `<span class="chip warn"><span class="dot"></span>${t("chipUpstreamDown")}</span>`) : ""}</span>
     </div>
+    <div class="proxy-usage-row">
+      <span class="proxy-usage-label">${esc(t("usageToday"))}</span>
+      <span class="proxy-usage-summary">${proxyUsageSummaryHtml()}</span>
+    </div>
     <div class="card-actions">
       ${running
         ? `<button class="mini-btn" data-act="proxyStop">${ic("stop", 12)}${t("proxyStop")}</button>`
         : `<button class="mini-btn primary" data-act="proxyStart">${ic("play", 12)}${t("proxyStart")}</button>`}
       <button class="mini-btn" data-act="proxyLog">${ic("doc", 12)}${t("proxyLog")}</button>
+      <button class="mini-btn" data-act="proxyUsage">${ic("chart", 12)}${esc(t("usageDetails"))}</button>
       <span class="spacer"></span>
       <button class="mini-btn" data-act="register">${ic("switch", 12)}${t("registerBtn")}</button>
     </div>
@@ -101,6 +161,7 @@ function proxyCard() {
 
 function render() {
   if (!state) return;
+  closeProxyUsage();
   const chips = [];
   chips.push(`<span class="chip ${state.lobster_running ? "on" : ""}"><span class="dot"></span>${t(state.lobster_running ? "chipLobsterOn" : "chipLobsterOff")}</span>`);
   if (state.live_logged_in) {
@@ -192,6 +253,7 @@ $app.addEventListener("click", (e) => {
   if (act === "proxyStart") return guard(doProxyStart);
   if (act === "proxyStop") return guard(doProxyStop);
   if (act === "proxyLog") return guard(showProxyLog);
+  if (act === "proxyUsage") return openProxyUsage();
   if (act === "register") return guard(doRegister);
   if (!acc) return;
   if (act === "switch") return guard(() => doSwitch(acc));
@@ -342,6 +404,121 @@ async function showProxyLog() {
     if (e.target === mask) mask.remove();
   });
   mask.querySelector(".pd-close").addEventListener("click", () => mask.remove());
+}
+
+function usageRows(data) {
+  const rows = data?.models || data?.by_model || data?.byModel || [];
+  return Array.isArray(rows) ? rows : [];
+}
+
+function usageDays(data) {
+  const rows = data?.daily || data?.days || data?.trend || [];
+  return Array.isArray(rows) ? rows : [];
+}
+
+function usageTrendHtml(data) {
+  const days = usageDays(data);
+  if (!days.length) return `<div class="usage-empty">${esc(t("usageNoData"))}</div>`;
+  const values = days.map((day) => {
+    const total = usageTotals(day);
+    return { label: day.day || day.date || "", value: total.total };
+  });
+  const max = Math.max(1, ...values.map((item) => item.value));
+  const width = Math.max(520, values.length * 34);
+  const height = 150;
+  const pad = 22;
+  const plotHeight = height - pad * 2;
+  const step = values.length > 1 ? (width - pad * 2) / (values.length - 1) : 0;
+  const points = values.map((item, i) => `${pad + i * step},${pad + plotHeight - (item.value / max) * plotHeight}`).join(" ");
+  const dots = values.map((item, i) => `<circle cx="${pad + i * step}" cy="${pad + plotHeight - (item.value / max) * plotHeight}" r="3"><title>${esc(item.label)}: ${fmtCount(item.value)}</title></circle>`).join("");
+  const labels = values.map((item, i) => `<span style="left:${values.length === 1 ? 50 : (i / (values.length - 1)) * 100}%">${esc(item.label.slice(5) || item.label)}</span>`).join("");
+  return `<div class="usage-chart-scroll"><div class="usage-chart" style="width:${width}px"><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(t("usageTrend"))}"><line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}"/><polyline points="${points}"/>${dots}</svg><div class="usage-chart-labels">${labels}</div></div></div>`;
+}
+
+function usageModelHtml(rows) {
+  return `<div class="usage-models">${rows.map((row) => {
+    const total = usageTotals(row);
+    const model = row.model || t("usageUnknownModel");
+    return `<div class="usage-model-row"><div class="usage-model-name" title="${esc(model)}">${esc(model)}</div><div>${fmtCount(total.requests)}</div><div>${fmtCount(total.input)}</div><div>${fmtCount(total.output)}</div><div>${fmtCount(total.total)}</div></div>`;
+  }).join("")}</div>`;
+}
+
+function renderUsageContent(data) {
+  if (!usageModal?.isConnected) return;
+  const total = usageTotals(data);
+  const models = usageRows(data);
+  const modelSection = models.length
+    ? `<div class="usage-model-head"><div>${esc(t("usageModel"))}</div><div>${esc(t("usageRequests"))}</div><div>${esc(t("usageInput"))}</div><div>${esc(t("usageOutput"))}</div><div>${esc(t("usageTotal"))}</div></div>${usageModelHtml(models)}`
+    : `<div class="usage-empty">${esc(t("usageNoData"))}</div>`;
+  usageModal.querySelector(".usage-content").innerHTML = `
+    <div class="usage-metrics">
+      <div><span>${esc(t("usageRequests"))}</span><b>${fmtCount(total.requests)}</b></div>
+      <div><span>${esc(t("usageInput"))}</span><b>${fmtCount(total.input)}</b></div>
+      <div><span>${esc(t("usageOutput"))}</span><b>${fmtCount(total.output)}</b></div>
+      <div><span>${esc(t("usageTotal"))}</span><b>${fmtCount(total.total)}</b></div>
+    </div>
+    <div class="usage-quality"><span class="accurate">${esc(t("usageAccurate"))}: <b>${fmtCount(total.accurate)}</b></span><span class="estimated">${esc(t("usageEstimated"))}: <b>${fmtCount(total.estimated)}</b></span><span class="missing">${esc(t("usageMissing"))}: <b>${fmtCount(total.missing)}</b></span></div>
+    <p class="usage-note">${esc(t("usageAccuracyNote"))}</p>
+    <section class="usage-section"><h3>${esc(t("usageTrend"))}</h3>${usageTrendHtml(data)}</section>
+    <section class="usage-section"><h3>${esc(t("usageByModel"))}</h3>${modelSection}</section>`;
+}
+
+async function loadProxyUsage(range) {
+  if (!usageModal?.isConnected) return;
+  const seq = ++usageRequestSeq;
+  usageModal.querySelectorAll(".usage-range").forEach((button) => button.classList.toggle("active", button.dataset.range === range));
+  usageModal.dataset.range = range;
+  usageModal.querySelector(".usage-content").innerHTML = `<div class="usage-empty">${esc(t("usageLoading"))}</div>`;
+  try {
+    const data = await invoke("proxy_usage", { range });
+    if (seq !== usageRequestSeq || !usageModal?.isConnected || usageModal.dataset.range !== range) return;
+    renderUsageContent(data);
+    if (range === "today") {
+      todayUsage = data;
+      renderProxyUsageSummary();
+    }
+  } catch (e) {
+    if (seq !== usageRequestSeq || !usageModal?.isConnected) return;
+    usageModal.querySelector(".usage-content").innerHTML = `<div class="usage-empty usage-error">${esc(stripErr(e))}</div>`;
+  }
+}
+
+function closeProxyUsage() {
+  clearInterval(usageRefreshTimer);
+  usageRefreshTimer = null;
+  usageRequestSeq++;
+  usageModal?.remove();
+  usageModal = null;
+}
+
+function openProxyUsage() {
+  closeProxyUsage();
+  const mask = document.createElement("div");
+  mask.className = "pd-mask usage-mask";
+  mask.dataset.range = "today";
+  mask.innerHTML = `
+    <div class="pd-panel usage-panel">
+      <div class="pd-head">
+        <span class="pd-title">${ic("chart", 16)}${esc(t("usageTitle"))}</span>
+        <button class="icon-btn pd-close" title="${esc(t("commonClose"))}">${ic("x", 14)}</button>
+      </div>
+      <div class="usage-ranges">
+        <button class="mini-btn usage-range active" data-range="today">${esc(t("usageRangeToday"))}</button>
+        <button class="mini-btn usage-range" data-range="7d">${esc(t("usageRange7d"))}</button>
+        <button class="mini-btn usage-range" data-range="30d">${esc(t("usageRange30d"))}</button>
+        <button class="mini-btn usage-range" data-range="all">${esc(t("usageRangeAll"))}</button>
+      </div>
+      <div class="usage-content"><div class="usage-empty">${esc(t("usageLoading"))}</div></div>
+    </div>`;
+  document.body.appendChild(mask);
+  usageModal = mask;
+  mask.addEventListener("click", (e) => {
+    if (e.target === mask || e.target.closest(".pd-close")) return closeProxyUsage();
+    const rangeButton = e.target.closest(".usage-range");
+    if (rangeButton) loadProxyUsage(rangeButton.dataset.range);
+  });
+  loadProxyUsage("today");
+  usageRefreshTimer = setInterval(() => loadProxyUsage(mask.dataset.range), 20000);
 }
 
 async function doRegister() {

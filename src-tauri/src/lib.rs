@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod proxy;
 pub mod register;
 pub mod store;
+pub mod usage;
 pub mod zcrypto;
 mod lockfile;
 
