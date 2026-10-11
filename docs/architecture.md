@@ -11,6 +11,8 @@
 │  ├ checkin.rs   三步签到引擎 + token 独立续期               │
 │  ├ guard.rs     LobsterAI.exe 探测/优雅关闭/启动            │
 │  ├ proxy.rs     Python 代理生命周期 + 三级 Python 发现       │
+│  ├ usage.rs     Token usage 只读查询 + 日/模型聚合           │
+│  ├ app.rs       Tauri GUI command 薄封装                     │
 │  ├ register.rs  ★CC-Switch 数据库注册（备份→upsert→还原）   │
 │  ├ zcrypto.rs   enc:v1 AES-256-GCM 账号凭据加密（家族复用）  │
 │  ├ lockfile.rs  ProxyLock 跨进程锁（家族复用）              │
@@ -19,7 +21,7 @@
 │  src-tauri/proxy/lobster_proxy.py                          │
 │    ★上游稳定器（探测轮换端口/key）                          │
 │    + Anthropic↔OpenAI 转换层（fork raccoon_proxy.py）       │
-│    + OpenAI 纯透传 + SSE 流式                               │
+│    + OpenAI 转发 + SSE 流式 + Token usage 日聚合            │
 └────────────────────────────────────────────────────────────┘
         │                              │
         ▼                              ▼
@@ -76,6 +78,7 @@ accounts\<uuid>\account.json   元数据 + auth_blob（enc:v1 加密的
 accounts\<uuid>\snapshot\      manifest 目录快照（对话记录副本）
 backups\                       首次切换前全量备份（安全网，永不自动删）
 proxy\                         lobster_proxy.py + config.json + proxy.log
+                               + usage.sqlite（运行时可能有 -wal/-shm）
 settings.json
 ```
 
@@ -109,9 +112,9 @@ token 策略：
 - 探活 = TCP 可连 + 最小 `POST /v1/chat/completions` 确认端点存在（上游无 `/v1/models`，HTTP 错误响应也表示服务在线）；
 - 缓存 60s；连接失败自动 force 重探测并重试一次；全挂返回 503（LobsterAI 未运行）。
 
-**Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上下游 usage 同时给出输入/输出 token，`estimated` 表示缺失时按本地规则估算（当前实际采集路径使用这两类），`missing` 为无法取得或估算时的保留口径。
+**Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），schema `user_version=2`，`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`，并可迁移旧 `daily_usage` 表。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上游响应 usage 同时给出输入/输出 token，缺任一字段时整次请求按本地规则记为 `estimated`；`missing` 是迁移未知旧来源或显式缺失记录的保留口径，正常采集主要使用前两类。
 
-Rust `proxy_usage(range)` 只读该库并校验 schema，范围仅支持 `today`、`7d`、`30d`、`all`，返回总计、按日和按模型汇总；不负责采集。前端入口在代理卡片的“今日用量”摘要及“用量详情”按钮，详情可切换上述范围。
+Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据库不存在时返回空报告；范围仅支持 `today`、`7d`、`30d`、`all`，返回总计、按日和按模型汇总。前端入口在代理卡片的“今日用量”摘要及“用量详情”按钮，详情还展示准确/估算/缺失请求数和日趋势。
 
 **端点**（监听 127.0.0.1:19260，config 可改）：
 
@@ -126,7 +129,7 @@ Rust `proxy_usage(range)` 只读该库并校验 schema，范围仅支持 `today`
 模型映射：上游存在的 ID 直通；`claude-*` 前缀按 config models 映射（默认 opus→glm-5.3、sonnet/haiku→deepseek-flash）；兜底 default_model。
 
 **CC-Switch 注册**（register.rs，移植 add_provider.py）：
-备份 `~\.cc-switch\cc-switch.db` → upsert provider「LobsterPlus(本地)」（apiFormat=anthropic native、`ANTHROPIC_BASE_URL=http://127.0.0.1:19260`、模型全映射）→ 还原写入前激活项（`--switch` 才切换）。Python 发现三级：PATH → `%APPDATA%\LobsterAI\runtimes\python-win\` → py.exe。
+备份 `~\.cc-switch\cc-switch.db` → upsert provider「LobsterPlus(本地)」（apiFormat=anthropic native、`ANTHROPIC_BASE_URL=http://127.0.0.1:19260`、模型全映射）→ 还原写入前激活项（`--switch` 才切换）。Python 发现三级：PATH → `%APPDATA%\LobsterAI\runtimes\python-win\` → py.exe；候选必须能实际启动，不能把 Windows Store App Execution Alias 当成真实解释器。
 
 ## 四、安全红线
 
@@ -141,12 +144,13 @@ Rust `proxy_usage(range)` 只读该库并校验 schema，范围仅支持 `today`
 - 本机固定 GNU 工具链（MSVC 残缺）：`scripts\build-release.cmd`（PATH 前置 `D:\mingw64\bin` + `--features tauri/custom-protocol` 嵌入前端）。
 - `[lib]` 只留 `rlib`（cdylib 超 MinGW ld 65535 符号上限）。
 - 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（含 Rust usage 只读查询；gui 层不进测试二进制）。
-- Python 用量存储自检（不访问真实上游）：`python src-tauri\proxy\lobster_proxy.py --selftest-storage`（schema/v1 迁移/WAL/聚合/失败/并发写入）。
+- Python 用量存储自检（不访问真实上游）：`"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage`（schema/v1 迁移/WAL/聚合/失败/并发写入；本机 PATH 的 `python` 是 Windows Store alias，不可用）。
 
 ## 六、E2E 验收清单
 
 1. `capture` 收编账号 A → 切换往返 A↔B → 两边对话记录（cowork_sessions 行数）完好；
 2. 全库签到（每个账号 today 状态 ok/done）；
 3. proxy start → `/health` 上游探测成功 → `/v1/messages` 与 `/v1/chat/completions` 各 curl 一次（含 SSE）；
-4. register → CC-Switch 出现 provider → Claude Code 实际对话一次；
-5. `schedule install` → schtasks 查询确认 → 次日 09:00 日志有签到记录。
+4. 上述请求后 `usage.sqlite` 按协议/模型只累计一次，GUI 今日摘要与 7d/30d/all 详情一致，数据库不含请求正文或密钥；
+5. register → CC-Switch 出现 provider → Claude Code 实际对话一次；
+6. `schedule install` → schtasks 查询确认 → 次日 09:00 日志有签到记录。

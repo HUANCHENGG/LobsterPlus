@@ -24,8 +24,9 @@ LobsterAI 的对话库（`cowork_sessions`/`cowork_messages`）没有账号字�
 
 LobsterAI 自带本地 OpenAI 兼容代理，但**端口和 apiKey 随每次重启轮换**（3248→3858→2880→1316…），接 CC-Switch 一配就失效。LobsterPlus 监听**固定端口 19260**：
 
-- 自动探测当前轮换的本地端口/key（models.json + openclaw.json 双候选 + TCP/`/v1/models` 探活），轮换对调用方彻底透明；
-- 双协议：`/v1/chat/completions`（OpenAI 纯透传）+ `/v1/messages`（Anthropic 协议转换，Claude Code 可直连）+ `/v1/models` + `/health`；
+- 自动探测当前轮换的本地端口/key（models.json + openclaw.json 双候选 + TCP/最小 chat 请求探活），轮换对调用方彻底透明；
+- 双协议：`/v1/chat/completions`（OpenAI）+ `/v1/messages`（Anthropic 协议转换，Claude Code 可直连）+ `/v1/models` + `/health`；
+- 本地按日统计请求与输入/输出 Token，区分上游准确 usage 和本地估算，支持今日、7 天、30 天、全部范围及按模型汇总；只保存聚合数据，不保存请求/响应正文或密钥；
 - **一键注册进 CC-Switch**（备份 db 后 SQL upsert provider，非破坏性），Base URL 填 `http://127.0.0.1:19260` 永不漂移。
 
 ## 架构蓝本
@@ -62,8 +63,9 @@ lobster-plus.exe --cli <子命令>
 
 ```
 scripts\build-release.cmd   （前端 + release exe，GNU 工具链）
-npm install && npm run tauri dev   （开发模式）
-cargo test --manifest-path src-tauri\Cargo.toml   （单元测试）
+npm ci && npm run tauri dev   （开发模式）
+cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features   （Rust 单元测试）
+"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage   （用量存储自检）
 ```
 
-详见 `docs/architecture.md`。
+详见 [架构说明](docs/architecture.md)。
