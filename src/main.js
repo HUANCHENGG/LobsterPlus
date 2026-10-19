@@ -271,22 +271,10 @@ function askConfirm(m) {
 }
 
 async function doCapture() {
-  if (state.lobster_running) {
-    const go = await askConfirm({
-      title: t("confirmCaptureTitle"),
-      desc: t("confirmCaptureDesc"),
-    });
-    if (!go) return;
-  }
   const r = await invoke("capture_current");
   await refresh();
   for (const w of r.warnings || []) toast(w, "info");
   toast(t("captured", { name: r.account.name }));
-  if (r.was_running && state.launch_after_switch) {
-    invoke("launch_lobster")
-      .then(() => refresh())
-      .catch(() => {});
-  }
 }
 
 async function doSwitch(acc) {
@@ -568,9 +556,6 @@ function openWizard() {
           await refresh();
           for (const w of r.warnings || []) toast(w, "info");
           toast(t("captured", { name: r.account.name }));
-          if (r.was_running && state.launch_after_switch) {
-            invoke("launch_lobster").catch(() => {});
-          }
         } catch (e) {
           toast(stripErr(e), "err");
         }

@@ -46,7 +46,7 @@
 - **对话库 `cowork_sessions`/`cowork_messages` 无任何账号/user_id 列**（全库扫描确认）——单账号设计，不能像 TraePlus 那样只换登录键靠数据库天然隔离；
 - app.asar 内有 Electron 单例锁（`app.requestSingleInstanceLock`），无法双开。
 
-所以账号隔离的唯一安全路径 = 账号私有路径在 live 与快照间整体搬移。
+所以切换时的账号隔离路径是账号私有状态在 live 与快照间整体交换；首次收编只创建副本，不参与交换。
 
 ### manifest（store 的账号私有路径，相对 `%APPDATA%\LobsterAI`）
 
@@ -54,7 +54,13 @@
 
 **排除**（可重建/静态，永远留在 live）：`Cache`、`Code Cache`、`GPUCache`、`Dawn*Cache`、`blob_storage`、`logs`、`updates`（298MB）、`runtimes`、`cowork`、`openclaw\{bin,logs,cache,media,.compile-cache}`、`lockfile`。
 
+### 在线首次收编（store.rs::capture_current）
+
+收编不关闭或重启 LobsterAI。持有 ProxyLock 后先验证 live 登录和重复账号，再在 staging 中用 SQLite Backup API 复制主库（包含当时已提交及活跃 WAL 中的数据，并做 `PRAGMA quick_check`）；其他 manifest 项逐项在线复制，跳过主库 `-wal/-shm`。这些文件不是一个跨文件事务，因此只保证 SQLite 副本自身一致，不承诺其他文件与数据库处于同一时刻。当前存在的 manifest 项除瞬态 `DIPS-wal`/`DIPS-shm` 外均为 required：复制失败会清理 staging 和新账号目录并使收编整体失败；两个 optional sidecar 失败只记 warnings。全部完成后将 staging 一次 rename 为 `snapshot`，元数据、版本及 refresh payload 均从已提交的快照数据库读取；live 全程只读、不移动。
+
 ### 切换流程（store.rs::switch_to）
+
+切换与 sync_back 保留原有离线移动语义，仍必须先停止 LobsterAI；在线收编不改变这条隔离红线。
 
 1. 目标 == 当前登录 → 仅 sync_back 保鲜；
 2. LobsterAI 运行中 → 优雅关闭（`taskkill /PID` 不带 /F 给 WAL 落盘机会，15s 超时回退强杀，等全部 Electron 进程退出）；

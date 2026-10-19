@@ -8,8 +8,8 @@
 
 LobsterAI 的对话库（`cowork_sessions`/`cowork_messages`）没有账号字段——整个数据目录按单账号设计。LobsterPlus 采用 **manifest 清单式目录快照交换**：
 
-- 收编账号 = 把 `%APPDATA%\LobsterAI` 里的账号私有路径（对话库、登录态、openclaw 状态、Cookies）整体存入该账号专属快照；
-- 切换账号 = 杀客户端 → 当前数据保鲜回源账号快照 → 目标账号快照恢复到 live → **读回校验**（live `auth_user.id` 必须等于目标账号）→ 可选重启；校验失败自动从首次切换前的全量备份回滚；
+- 首次收编账号 = LobsterAI 不会被关闭或重启；主数据库用 SQLite Backup API 从活跃 WAL 创建数据库一致副本，其余账号私有路径逐项在线复制到 staging，成功后一次提交快照，live 全程不移动；SQLite 之外的文件不承诺跨文件同一时刻一致；
+- 切换账号仍需停机 = 杀客户端 → 当前数据保鲜回源账号快照 → 目标账号快照恢复到 live → **读回校验**（live `auth_user.id` 必须等于目标账号）→ 可选重启；校验失败自动从首次切换前的全量备份回滚；
 - 可重建的缓存（Cache、logs、updates 298MB、python 运行时等）永远留在 live 目录，不进快照，切换开销最小化。
 
 ### 2. 全库每日自动签到
@@ -41,8 +41,8 @@ LobsterAI 自带本地 OpenAI 兼容代理，但**端口和 apiKey 随每次重�
 lobster-plus.exe --cli <子命令>
   state          全量状态 JSON
   list           账号列表
-  capture        收编当前登录 [--name]
-  switch --id <id> [--force] [--dry-run]
+  capture        在线收编当前登录 [--name] [--restart]
+  switch --id <id> [--force] [--dry-run] [--restart|--no-restart]
   rename / delete / launch / kill / setpath / behavior
   checkin [--id]  全库（或单账号）签到
   proxy start|stop|status|log

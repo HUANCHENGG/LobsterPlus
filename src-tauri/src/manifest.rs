@@ -17,6 +17,7 @@
 //! Windows 文件占用：客户端退出后仍可能短暂持有句柄（杀毒扫描等），
 //! 拷贝/删除带重试。
 
+use crate::kvdb;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,14 @@ pub const MANIFEST_PATHS: &[&str] = &[
     // 客户端 skill 目录（33 个内置 skill，账号可自装）
     "SKILLs",
 ];
+
+/// 在线收编中允许降级为 warning 的真正可选/瞬态项。
+/// 其余当前 live 中实际存在的 manifest 项都承载账号状态，复制失败必须整体失败。
+const ONLINE_OPTIONAL_PATHS: &[&str] = &["DIPS-wal", "DIPS-shm"];
+
+fn online_path_is_optional(rel: &str) -> bool {
+    ONLINE_OPTIONAL_PATHS.contains(&rel)
+}
 
 /// live 数据目录下要显式排除的路径（可重建缓存，永远不进快照，也不许误拷）。
 /// manifest 之外的目录本来就不交换，这里用于 dry-run 展示与防御性校验。
@@ -129,15 +138,17 @@ pub fn path_size(p: &Path) -> u64 {
 
 fn retry_op<T>(op: impl Fn() -> Result<T, std::io::Error>, what: &str) -> Result<T, String> {
     let deadline = Instant::now() + Duration::from_secs(8);
-    let mut last: Option<std::io::Error> = None;
     loop {
         match op() {
             Ok(v) => return Ok(v),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) || e.raw_os_error() == Some(5) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(32)
+                    || e.raw_os_error() == Some(5) =>
+            {
                 // ERROR_SHARING_VIOLATION(32) / ACCESS_DENIED(5)：Windows 句柄占用，重试
-                last = Some(e);
                 if Instant::now() >= deadline {
-                    return Err(format!("{what} 失败（文件被占用，重试耗尽）：{}", last.unwrap()));
+                    return Err(format!("{what} 失败（文件被占用，重试耗尽）：{e}"));
                 }
                 std::thread::sleep(Duration::from_millis(400));
             }
@@ -152,7 +163,8 @@ fn retry_op<T>(op: impl Fn() -> Result<T, std::io::Error>, what: &str) -> Result
 /// 递归拷贝目录（覆盖目标已存在内容）。目标父目录自动创建。
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("创建目录失败 {}：{e}", dst.display()))?;
-    for entry in fs::read_dir(src).map_err(|e| format!("读取目录失败 {}：{e}", src.display()))? {
+    for entry in fs::read_dir(src).map_err(|e| format!("读取目录失败 {}：{e}", src.display()))?
+    {
         let entry = entry.map_err(|e| format!("读取目录失败 {e}"))?;
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         let from = entry.path();
@@ -176,7 +188,10 @@ pub fn remove_path(p: &Path) -> Result<(), String> {
     }
     let meta = fs::symlink_metadata(p).map_err(|e| e.to_string())?;
     if meta.is_dir() {
-        retry_op(|| fs::remove_dir_all(p), &format!("删除目录 {}", p.display()))
+        retry_op(
+            || fs::remove_dir_all(p),
+            &format!("删除目录 {}", p.display()),
+        )
     } else {
         retry_op(|| fs::remove_file(p), &format!("删除文件 {}", p.display()))
     }
@@ -188,7 +203,8 @@ fn move_live_to_snapshot(live: &Path, snap: &Path) -> Result<(), String> {
         return Ok(());
     }
     if let Some(parent) = snap.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败 {}：{e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录失败 {}：{e}", parent.display()))?;
     }
     // 快照侧已有旧内容：先清掉（sync_back 全量覆盖语义）
     remove_path(snap)?;
@@ -213,7 +229,8 @@ fn restore_one(snap: &Path, live: &Path) -> Result<(), String> {
         return Ok(());
     }
     if let Some(parent) = live.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败 {}：{e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录失败 {}：{e}", parent.display()))?;
     }
     let meta = fs::symlink_metadata(snap).map_err(|e| e.to_string())?;
     if meta.is_dir() {
@@ -243,6 +260,8 @@ pub struct ExchangeReport {
     pub restored: Vec<String>,
     /// live 侧存在但快照缺失（目标账号从未有过该项）的路径
     pub skipped: Vec<String>,
+    /// 在线快照时非核心项复制失败；不阻止核心数据库提交。
+    pub warnings: Vec<String>,
 }
 
 /// dry-run：列出 live 数据目录中实际存在的 manifest 路径。
@@ -256,7 +275,10 @@ pub fn live_manifest_paths(live_dir: &Path) -> Vec<String> {
 
 /// 把 live 的全部 manifest 路径保存进账号快照目录（收编 / sync_back / 交换第一步）。
 /// 全量覆盖：快照侧旧内容先删。
-pub fn save_live_to_snapshot(live_dir: &Path, account_dir: &Path) -> Result<ExchangeReport, String> {
+pub fn save_live_to_snapshot(
+    live_dir: &Path,
+    account_dir: &Path,
+) -> Result<ExchangeReport, String> {
     let snap_root = snapshot_root(account_dir);
     fs::create_dir_all(&snap_root).map_err(|e| format!("创建快照目录失败：{e}"))?;
     let mut report = ExchangeReport::default();
@@ -272,15 +294,96 @@ pub fn save_live_to_snapshot(live_dir: &Path, account_dir: &Path) -> Result<Exch
     Ok(report)
 }
 
+/// 在线复制 live manifest 到新账号快照。数据库使用 SQLite Backup API，其他项只复制，
+/// WAL/SHM 不单独复制。staging 完成后才提交，因此失败不会破坏 live 或留下半快照。
+pub fn copy_live_to_snapshot_online(
+    live_dir: &Path,
+    account_dir: &Path,
+) -> Result<ExchangeReport, String> {
+    let final_root = snapshot_root(account_dir);
+    let staging = account_dir.join(format!(
+        "snapshot.staging-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    remove_path(&staging)?;
+    fs::create_dir_all(&staging).map_err(|e| format!("创建快照 staging 失败：{e}"))?;
+    let mut report = ExchangeReport::default();
+
+    if let Err(e) = kvdb::backup_online(
+        &join_rel(live_dir, "lobsterai.sqlite"),
+        &join_rel(&staging, "lobsterai.sqlite"),
+    ) {
+        let _ = remove_path(&staging);
+        return Err(e);
+    }
+    report.preserved.push("lobsterai.sqlite".into());
+
+    for m in MANIFEST_PATHS {
+        if matches!(
+            *m,
+            "lobsterai.sqlite" | "lobsterai.sqlite-wal" | "lobsterai.sqlite-shm"
+        ) {
+            continue;
+        }
+        let source = join_rel(live_dir, m);
+        if !source.exists() {
+            continue;
+        }
+        let destination = join_rel(&staging, m);
+        let result = (|| {
+            let meta = fs::symlink_metadata(&source).map_err(|e| e.to_string())?;
+            if meta.is_dir() {
+                copy_dir_all(&source, &destination)
+            } else {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                retry_op(
+                    || fs::copy(&source, &destination),
+                    &format!("拷贝 {}", source.display()),
+                )
+                .map(|_| ())
+            }
+        })();
+        match result {
+            Ok(()) => report.preserved.push(m.to_string()),
+            Err(e) if online_path_is_optional(m) => report.warnings.push(format!("{m}: {e}")),
+            Err(e) => {
+                let _ = remove_path(&staging);
+                return Err(format!("复制必需账号状态 {m} 失败：{e}"));
+            }
+        }
+    }
+
+    if final_root.exists() {
+        let _ = remove_path(&staging);
+        return Err(format!("快照目录已存在：{}", final_root.display()));
+    }
+    if let Err(e) = retry_op(
+        || fs::rename(&staging, &final_root),
+        &format!("提交在线快照 {}", final_root.display()),
+    ) {
+        let _ = remove_path(&staging);
+        return Err(e);
+    }
+    Ok(report)
+}
+
 /// 把账号快照目录的 manifest 路径恢复到 live（切换第二步）。
 /// live 侧当前内容应已被 save_live_to_snapshot 移走；残留（快照没有的项）会被清除
 /// （防止上个账号的对话库残留串号——这是对话隔离的关键防线）。
-pub fn restore_snapshot_to_live(account_dir: &Path, live_dir: &Path) -> Result<ExchangeReport, String> {
+pub fn restore_snapshot_to_live(
+    account_dir: &Path,
+    live_dir: &Path,
+) -> Result<ExchangeReport, String> {
     restore_tree_to_live(&snapshot_root(account_dir), live_dir)
 }
 
 /// 备份目录回滚（读回校验失败安全网）。备份目录与快照目录同构。
-pub fn restore_backup_to_live(backup_dir: &Path, live_dir: &Path) -> Result<ExchangeReport, String> {
+pub fn restore_backup_to_live(
+    backup_dir: &Path,
+    live_dir: &Path,
+) -> Result<ExchangeReport, String> {
     restore_tree_to_live(backup_dir, live_dir)
 }
 
@@ -324,7 +427,10 @@ pub fn backup_live(live_dir: &Path, backup_dir: &Path) -> Result<Vec<String>, St
             if let Some(p) = dst.parent() {
                 fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
-            retry_op(|| fs::copy(&live, &dst), &format!("备份 {}", live.display()))?;
+            retry_op(
+                || fs::copy(&live, &dst),
+                &format!("备份 {}", live.display()),
+            )?;
         }
         out.push(m.to_string());
     }
@@ -360,9 +466,23 @@ mod tests {
         touch(&dir.join("lobsterai.sqlite"), "db-A");
         touch(&dir.join("lobsterai.sqlite-wal"), "wal-A");
         touch(&dir.join("Network").join("Cookies"), "cookies-A");
-        touch(&dir.join("openclaw").join("state").join("openclaw.json"), "oc-A");
-        touch(&dir.join("openclaw").join("state").join("agents").join("main").join("agent").join("openclaw-agent.sqlite"), "agent-A");
-        touch(&dir.join("SKILLs").join("checkin").join("SKILL.md"), "skill-A");
+        touch(
+            &dir.join("openclaw").join("state").join("openclaw.json"),
+            "oc-A",
+        );
+        touch(
+            &dir.join("openclaw")
+                .join("state")
+                .join("agents")
+                .join("main")
+                .join("agent")
+                .join("openclaw-agent.sqlite"),
+            "agent-A",
+        );
+        touch(
+            &dir.join("SKILLs").join("checkin").join("SKILL.md"),
+            "skill-A",
+        );
         // 排除项（不该进快照）
         touch(&dir.join("Cache").join("x.bin"), "cache-A");
         touch(&dir.join("logs").join("main.log"), "log-A");
@@ -373,7 +493,11 @@ mod tests {
 
     #[test]
     fn manifest_has_no_conflicts() {
-        assert!(manifest_conflicts().is_empty(), "manifest 与排除清单重叠：{:?}", manifest_conflicts());
+        assert!(
+            manifest_conflicts().is_empty(),
+            "manifest 与排除清单重叠：{:?}",
+            manifest_conflicts()
+        );
     }
 
     #[test]
@@ -394,7 +518,10 @@ mod tests {
 
         // live 变成 B（模拟客户端生成了 B 的数据）
         touch(&live.join("lobsterai.sqlite"), "db-B");
-        touch(&live.join("openclaw").join("state").join("openclaw.json"), "oc-B");
+        touch(
+            &live.join("openclaw").join("state").join("openclaw.json"),
+            "oc-B",
+        );
         touch(&live.join("Network").join("Cookies"), "cookies-B");
 
         // B 收编：live → B 快照
@@ -403,25 +530,83 @@ mod tests {
         // 切回 A：A 快照 → live
         let r = restore_snapshot_to_live(&acc_a, &live).unwrap();
         assert!(r.restored.contains(&"lobsterai.sqlite".to_string()));
-        assert_eq!(fs::read_to_string(live.join("lobsterai.sqlite")).unwrap(), "db-A");
-        assert_eq!(fs::read_to_string(live.join("openclaw").join("state").join("openclaw.json")).unwrap(), "oc-A");
         assert_eq!(
-            fs::read_to_string(live.join("openclaw").join("state").join("agents").join("main").join("agent").join("openclaw-agent.sqlite")).unwrap(),
+            fs::read_to_string(live.join("lobsterai.sqlite")).unwrap(),
+            "db-A"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("openclaw").join("state").join("openclaw.json")).unwrap(),
+            "oc-A"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                live.join("openclaw")
+                    .join("state")
+                    .join("agents")
+                    .join("main")
+                    .join("agent")
+                    .join("openclaw-agent.sqlite")
+            )
+            .unwrap(),
             "agent-A"
         );
 
         // 切到 B：先把 live 存回 A，再恢复 B
         save_live_to_snapshot(&live, &acc_a).unwrap();
         restore_snapshot_to_live(&acc_b, &live).unwrap();
-        assert_eq!(fs::read_to_string(live.join("lobsterai.sqlite")).unwrap(), "db-B");
+        assert_eq!(
+            fs::read_to_string(live.join("lobsterai.sqlite")).unwrap(),
+            "db-B"
+        );
         // B 快照没有 SKILLs（make_live 未重建）→ live 的 SKILLs 被清除（串号防线）
         assert!(!live.join("SKILLs").exists());
         // A 快照里 SKILLs 完好
-        assert!(acc_a.join("snapshot").join("SKILLs").join("checkin").join("SKILL.md").exists());
+        assert!(acc_a
+            .join("snapshot")
+            .join("SKILLs")
+            .join("checkin")
+            .join("SKILL.md")
+            .exists());
 
         let _ = fs::remove_dir_all(&live);
         let _ = fs::remove_dir_all(&acc_a);
         let _ = fs::remove_dir_all(&acc_b);
+    }
+
+    #[test]
+    fn online_snapshot_keeps_live_and_skips_wal_sidecars() {
+        let live = std::env::temp_dir().join(format!("lp-online-live-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&live).unwrap();
+        let db = live.join("lobsterai.sqlite");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer.execute_batch("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT); INSERT INTO kv VALUES ('x', 'from-wal');").unwrap();
+        touch(&live.join("Network").join("Cookies"), "cookies-live");
+        let account = std::env::temp_dir().join(format!("lp-online-acc-{}", uuid::Uuid::new_v4()));
+
+        let report = copy_live_to_snapshot_online(&live, &account).unwrap();
+        let snap = snapshot_root(&account);
+        assert!(report.preserved.contains(&"lobsterai.sqlite".to_string()));
+        assert!(db.exists());
+        assert_eq!(
+            fs::read_to_string(live.join("Network").join("Cookies")).unwrap(),
+            "cookies-live"
+        );
+        assert!(snap.join("Network").join("Cookies").exists());
+        assert!(!snap.join("lobsterai.sqlite-wal").exists());
+        assert!(!snap.join("lobsterai.sqlite-shm").exists());
+        let value: String = rusqlite::Connection::open(snap.join("lobsterai.sqlite"))
+            .unwrap()
+            .query_row("SELECT value FROM kv WHERE key='x'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "from-wal");
+        writer
+            .execute("INSERT INTO kv VALUES ('y', 'live-still-writable')", [])
+            .unwrap();
+        drop(writer);
+        let _ = fs::remove_dir_all(live);
+        let _ = fs::remove_dir_all(account);
     }
 
     #[test]
@@ -431,8 +616,14 @@ mod tests {
         let backed = backup_live(&live, &bak).unwrap();
         assert!(backed.contains(&"lobsterai.sqlite".to_string()));
         // live 原样保留
-        assert_eq!(fs::read_to_string(live.join("lobsterai.sqlite")).unwrap(), "db-A");
-        assert_eq!(fs::read_to_string(bak.join("lobsterai.sqlite")).unwrap(), "db-A");
+        assert_eq!(
+            fs::read_to_string(live.join("lobsterai.sqlite")).unwrap(),
+            "db-A"
+        );
+        assert_eq!(
+            fs::read_to_string(bak.join("lobsterai.sqlite")).unwrap(),
+            "db-A"
+        );
         let _ = fs::remove_dir_all(&live);
         let _ = fs::remove_dir_all(&bak);
     }

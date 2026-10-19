@@ -304,7 +304,7 @@ mod tests {
         PRIMARY KEY (day, protocol, model)
     )";
 
-    fn make_db(rows: &[(&str, &str, &str, u64, u64, u64, u64, u64, u64, u64)]) -> PathBuf {
+    fn make_db(rows: &[(&str, &str, &str, u64, u64, u64, u64, u64, u64, u64, u64)]) -> PathBuf {
         let dir = temp_path("db");
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("usage.sqlite");

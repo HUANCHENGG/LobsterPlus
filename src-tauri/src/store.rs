@@ -43,17 +43,37 @@ impl Paths {
         Paths { home }
     }
 
-    pub fn store_dir(&self) -> PathBuf { self.home.join(".lobster-plus") }
-    pub fn accounts_dir(&self) -> PathBuf { self.store_dir().join("accounts") }
-    pub fn backups_dir(&self) -> PathBuf { self.store_dir().join("backups") }
-    pub fn settings_file(&self) -> PathBuf { self.store_dir().join("settings.json") }
-    pub fn proxy_dir(&self) -> PathBuf { self.store_dir().join("proxy") }
-    pub fn proxy_script(&self) -> PathBuf { self.proxy_dir().join("lobster_proxy.py") }
-    pub fn proxy_config(&self) -> PathBuf { self.proxy_dir().join("config.json") }
-    pub fn proxy_log(&self) -> PathBuf { self.proxy_dir().join("proxy.log") }
+    pub fn store_dir(&self) -> PathBuf {
+        self.home.join(".lobster-plus")
+    }
+    pub fn accounts_dir(&self) -> PathBuf {
+        self.store_dir().join("accounts")
+    }
+    pub fn backups_dir(&self) -> PathBuf {
+        self.store_dir().join("backups")
+    }
+    pub fn settings_file(&self) -> PathBuf {
+        self.store_dir().join("settings.json")
+    }
+    pub fn proxy_dir(&self) -> PathBuf {
+        self.store_dir().join("proxy")
+    }
+    pub fn proxy_script(&self) -> PathBuf {
+        self.proxy_dir().join("lobster_proxy.py")
+    }
+    pub fn proxy_config(&self) -> PathBuf {
+        self.proxy_dir().join("config.json")
+    }
+    pub fn proxy_log(&self) -> PathBuf {
+        self.proxy_dir().join("proxy.log")
+    }
     /// 某账号的专属目录（account.json + snapshot/）。
-    pub fn account_dir(&self, id: &str) -> PathBuf { self.accounts_dir().join(id) }
-    pub fn account_file(&self, id: &str) -> PathBuf { self.account_dir(id).join("account.json") }
+    pub fn account_dir(&self, id: &str) -> PathBuf {
+        self.accounts_dir().join(id)
+    }
+    pub fn account_file(&self, id: &str) -> PathBuf {
+        self.account_dir(id).join("account.json")
+    }
 
     /// LobsterAI live 数据目录（%APPDATA%\LobsterAI）。
     pub fn live_dir(&self) -> PathBuf {
@@ -67,7 +87,9 @@ impl Paths {
         roaming.join("LobsterAI")
     }
 
-    pub fn live_db(&self) -> PathBuf { self.live_dir().join("lobsterai.sqlite") }
+    pub fn live_db(&self) -> PathBuf {
+        self.live_dir().join("lobsterai.sqlite")
+    }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
         fs::create_dir_all(self.accounts_dir())
@@ -80,8 +102,15 @@ impl Paths {
     }
 }
 
-pub fn pick_home(custom: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
-    custom.or(userprofile).or(home_env).unwrap_or_else(|| PathBuf::from("."))
+pub fn pick_home(
+    custom: Option<PathBuf>,
+    userprofile: Option<PathBuf>,
+    home_env: Option<PathBuf>,
+) -> PathBuf {
+    custom
+        .or(userprofile)
+        .or(home_env)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn in_sandbox() -> bool {
@@ -132,8 +161,12 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn launch_after_switch(&self) -> bool { self.launch_after_switch.unwrap_or(true) }
-    pub fn proxy_autostart(&self) -> bool { self.proxy_autostart.unwrap_or(false) }
+    pub fn launch_after_switch(&self) -> bool {
+        self.launch_after_switch.unwrap_or(true)
+    }
+    pub fn proxy_autostart(&self) -> bool {
+        self.proxy_autostart.unwrap_or(false)
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -194,11 +227,18 @@ pub fn now_ms() -> i64 {
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
-    fs::write(&tmp, data)
-        .map_err(|e| trf("err.write_file", &[("path", &path.display().to_string()), ("e", &e.to_string())]))?;
+    fs::write(&tmp, data).map_err(|e| {
+        trf(
+            "err.write_file",
+            &[("path", &path.display().to_string()), ("e", &e.to_string())],
+        )
+    })?;
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(trf("err.rename_fail", &[("path", &path.display().to_string()), ("e", &e.to_string())]));
+        return Err(trf(
+            "err.rename_fail",
+            &[("path", &path.display().to_string()), ("e", &e.to_string())],
+        ));
     }
     Ok(())
 }
@@ -283,8 +323,12 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
     }
     let mut out = vec![];
     // 账号库结构：accounts\<uuid>\account.json（两层，uuid 目录还装 snapshot/）
-    for entry in fs::read_dir(&dir).map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))? {
-        let sub = entry.map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?.path();
+    for entry in
+        fs::read_dir(&dir).map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?
+    {
+        let sub = entry
+            .map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?
+            .path();
         let path = sub.join("account.json");
         if !path.is_file() {
             continue;
@@ -313,9 +357,10 @@ pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
         return Err(tr("err.store.bad_id"));
     }
     let path = paths.account_file(id);
-    let raw = fs::read_to_string(&path)
-        .map_err(|_| trf("err.store.no_account_id", &[("id", id)]))?;
-    serde_json::from_str::<Account>(&raw).map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))
+    let raw =
+        fs::read_to_string(&path).map_err(|_| trf("err.store.no_account_id", &[("id", id)]))?;
+    serde_json::from_str::<Account>(&raw)
+        .map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))
 }
 
 fn name_exists(accounts: &[Account], name: &str) -> bool {
@@ -369,7 +414,13 @@ pub fn read_live_login(paths: &Paths) -> Result<Option<LiveLogin>, String> {
         .as_ref()
         .and_then(|u| u.get("yid").and_then(|v| v.as_str()))
         .map(String::from);
-    Ok(Some(LiveLogin { user_id, nickname, yid, access, refresh }))
+    Ok(Some(LiveLogin {
+        user_id,
+        nickname,
+        yid,
+        access,
+        refresh,
+    }))
 }
 
 /// 当前 live 登录是否就是该账号（user_id 主键 + auth_ref 兜底）。
@@ -389,34 +440,51 @@ pub struct CaptureOutcome {
     pub was_running: bool,
 }
 
-/// 收编当前登录为新账号：优雅关闭客户端（WAL 落盘）→ 全量快照 manifest 路径
-/// → 解析身份 + 加密登录 blob。失败时尽量代为重启客户端。
+/// 在线收编当前登录：不关闭 LobsterAI，通过 SQLite Backup API 和只复制 manifest
+/// 创建一致快照。ProxyLock 防止与切换、签到回写等跨进程操作并发。
 pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<CaptureOutcome, String> {
     let mut warnings: Vec<String> = vec![];
     let was_running = guard::lobster_running(paths);
-    if was_running {
-        guard::close_lobster_graceful(paths)?;
-        warnings.push(tr("state.capture_closed"));
-    }
-    match capture_from_disk(paths, name, &mut warnings) {
-        Ok(account) => Ok(CaptureOutcome { account, warnings, was_running }),
-        Err(e) => {
-            if was_running {
-                let (p, ok) = guard::effective_lobster_path(paths);
-                if ok {
-                    let _ = guard::launch_lobster(&p);
-                }
-            }
-            Err(e)
-        }
-    }
+    let live_dir = paths.live_dir();
+    let _lock = ProxyLock::acquire(&live_dir, LOCK_TIMEOUT, LOCK_STALE)
+        .map_err(|e| trf("err.switch.lock", &[("e", &e)]))?;
+    let account = capture_from_disk_online(paths, name, &mut warnings)?;
+    Ok(CaptureOutcome {
+        account,
+        warnings,
+        was_running,
+    })
 }
 
-fn capture_from_disk(paths: &Paths, name: Option<String>, warnings: &mut Vec<String>) -> Result<Account, String> {
+fn capture_from_disk_online(
+    paths: &Paths,
+    name: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Result<Account, String> {
+    capture_from_disk_impl(paths, name, warnings, true)
+}
+
+fn capture_from_disk(
+    paths: &Paths,
+    name: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Result<Account, String> {
+    capture_from_disk_impl(paths, name, warnings, false)
+}
+
+fn capture_from_disk_impl(
+    paths: &Paths,
+    name: Option<String>,
+    warnings: &mut Vec<String>,
+    online: bool,
+) -> Result<Account, String> {
     let live_dir = paths.live_dir();
     let db = paths.live_db();
     if !db.is_file() {
-        return Err(trf("err.capture.no_db", &[("path", &db.display().to_string())]));
+        return Err(trf(
+            "err.capture.no_db",
+            &[("path", &db.display().to_string())],
+        ));
     }
     let Some(login) = read_live_login(paths)? else {
         return Err(tr("err.capture.not_logged_in"));
@@ -426,70 +494,93 @@ fn capture_from_disk(paths: &Paths, name: Option<String>, warnings: &mut Vec<Str
     }
     let accounts = list_accounts(paths)?;
     if accounts.iter().any(|a| a.user_id == login.user_id) {
-        let dup = accounts.iter().find(|a| a.user_id == login.user_id).unwrap();
+        let dup = accounts
+            .iter()
+            .find(|a| a.user_id == login.user_id)
+            .unwrap();
         return Err(trf("err.live.dup_saved", &[("name", &dup.name)]));
     }
 
-    // 全量快照：live manifest 路径 → snapshot/
     let id = Uuid::new_v4().to_string();
     let acc_dir = paths.account_dir(&id);
-    manifest::save_live_to_snapshot(&live_dir, &acc_dir)
+    let result = (|| {
+        let report = if online {
+            manifest::copy_live_to_snapshot_online(&live_dir, &acc_dir)
+        } else {
+            manifest::save_live_to_snapshot(&live_dir, &acc_dir)
+        }
         .map_err(|e| trf("err.capture.snapshot", &[("e", &e)]))?;
-    if !manifest::snapshot_root(&acc_dir).join("lobsterai.sqlite").exists() {
+        warnings.extend(report.warnings);
+        let snapshot_db = manifest::snapshot_root(&acc_dir).join("lobsterai.sqlite");
+        if !snapshot_db.exists() {
+            return Err(tr("err.capture.snapshot_no_db"));
+        }
+
+        // 元数据只从已提交快照读取，确保身份/blob 与保存下来的数据库完全一致。
+        let Some((access, refresh)) = kvdb::read_auth_tokens(&snapshot_db)? else {
+            return Err(tr("err.capture.not_logged_in"));
+        };
+        let snapshot_user_id = kvdb::read_user_id(&snapshot_db)?.unwrap_or_default();
+        if snapshot_user_id != login.user_id {
+            return Err(tr("err.capture.no_user_id"));
+        }
+        let client_version = kvdb::read_client_version(&snapshot_db, "2026.9.4")
+            .unwrap_or_else(|_| "2026.9.4".into());
+        let rp = kvdb::read_refresh_payload(&snapshot_db, &client_version);
+        let blob = AuthBlob {
+            access_token: access.clone(),
+            refresh_token: refresh.clone(),
+            first_keyfrom: rp.first_keyfrom,
+            latest_keyfrom: rp.latest_keyfrom,
+            uuid: rp.uuid,
+            user_id: Some(snapshot_user_id.clone()),
+            version: Some(client_version),
+        };
+        let auth_blob = encode_auth_blob(&blob, &paths.secret())
+            .map_err(|e| trf("err.store.corrupt", &[("e", &e)]))?;
+        let base = match name {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => login
+                .nickname
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| format!("账号 {}", Local::now().format("%m-%d %H%M"))),
+        };
+        let ts = now_ts();
+        let acc = Account {
+            id: id.clone(),
+            name: unique_name(&accounts, &base),
+            created_at: ts.clone(),
+            updated_at: ts,
+            user_id: snapshot_user_id,
+            nickname: login.nickname.clone(),
+            yid: login.yid.clone(),
+            auth_blob: Some(auth_blob),
+            auth_ref: ref_of_token(&refresh),
+            token_exp_ms: jwt_exp_ms(&access),
+            last_checkin: None,
+        };
+        save_account(paths, &acc)?;
+        if manifest::snapshot_size(&acc_dir) == 0 {
+            warnings.push(tr("state.capture_empty_snapshot"));
+        }
+        Ok(acc)
+    })();
+    if result.is_err() {
         let _ = fs::remove_dir_all(&acc_dir);
-        return Err(tr("err.capture.snapshot_no_db"));
     }
-
-    // 登录 blob（签到独立续期用）
-    let client_version = kvdb::read_client_version(&db, "2026.9.4").unwrap_or_else(|_| "2026.9.4".into());
-    let rp = kvdb::read_refresh_payload(&db, &client_version);
-    let blob = AuthBlob {
-        access_token: login.access.clone(),
-        refresh_token: login.refresh.clone(),
-        first_keyfrom: rp.first_keyfrom,
-        latest_keyfrom: rp.latest_keyfrom,
-        uuid: rp.uuid,
-        user_id: Some(login.user_id.clone()),
-        version: Some(client_version),
-    };
-    let secret = paths.secret();
-    let auth_blob = encode_auth_blob(&blob, &secret)
-        .map_err(|e| trf("err.store.corrupt", &[("e", &e)]))?;
-
-    let base = match name {
-        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-        _ => login
-            .nickname
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("账号 {}", Local::now().format("%m-%d %H%M"))),
-    };
-    let ts = now_ts();
-    let acc = Account {
-        id,
-        name: unique_name(&accounts, &base),
-        created_at: ts.clone(),
-        updated_at: ts,
-        user_id: login.user_id,
-        nickname: login.nickname,
-        yid: login.yid,
-        auth_blob: Some(auth_blob),
-        auth_ref: ref_of_token(&login.refresh),
-        token_exp_ms: jwt_exp_ms(&login.access),
-        last_checkin: None,
-    };
-    save_account(paths, &acc)?;
-    if manifest::snapshot_size(&acc_dir) == 0 {
-        warnings.push(tr("state.capture_empty_snapshot"));
-    }
-    Ok(acc)
+    result
 }
 
 // ---------- 切换 ----------
 
 /// sync_back：把 live 当前 manifest 状态移回它所属账号的快照（对话/token 全量保鲜）。
 /// live 登录不属于任何已知账号时收编为新账号（auto_preserve 语义合并在此）。
-fn sync_back(paths: &Paths, accounts: &[Account], warnings: &mut Vec<String>) -> Result<Option<String>, String> {
+fn sync_back(
+    paths: &Paths,
+    accounts: &[Account],
+    warnings: &mut Vec<String>,
+) -> Result<Option<String>, String> {
     let live_dir = paths.live_dir();
     let Some(login) = read_live_login(paths)? else {
         return Ok(None);
@@ -502,7 +593,10 @@ fn sync_back(paths: &Paths, accounts: &[Account], warnings: &mut Vec<String>) ->
         let captured = capture_from_disk(paths, None, warnings)?;
         return Ok(Some(captured.name));
     }
-    let acc = accounts.iter().find(|a| same_login(Some(&login), a)).unwrap();
+    let acc = accounts
+        .iter()
+        .find(|a| same_login(Some(&login), a))
+        .unwrap();
     let acc_dir = paths.account_dir(&acc.id);
     manifest::save_live_to_snapshot(&live_dir, &acc_dir)
         .map_err(|e| trf("err.switch.sync_back", &[("e", &e)]))?;
@@ -532,7 +626,10 @@ fn first_backup(paths: &Paths) -> Result<Option<String>, String> {
     if !live_dir.is_dir() {
         return Ok(None);
     }
-    let dest = bd.join(format!("pre-first-switch-{}", Local::now().format("%Y%m%d-%H%M%S")));
+    let dest = bd.join(format!(
+        "pre-first-switch-{}",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
     manifest::backup_live(&live_dir, &dest).map_err(|e| e.to_string())?;
     Ok(Some(dest.to_string_lossy().to_string()))
 }
@@ -561,11 +658,19 @@ fn rollback_from_backup(paths: &Paths) -> Result<(), String> {
         .map_err(|e| trf("err.switch.rollback", &[("e", &e)]))
 }
 
-pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool) -> Result<SwitchResult, String> {
+pub fn switch_to(
+    paths: &Paths,
+    id: &str,
+    force: bool,
+    restart: bool,
+) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let live_dir = paths.live_dir();
     if !live_dir.is_dir() {
-        return Err(trf("err.capture.no_db", &[("path", &live_dir.display().to_string())]));
+        return Err(trf(
+            "err.capture.no_db",
+            &[("path", &live_dir.display().to_string())],
+        ));
     }
     let mut warnings: Vec<String> = vec![];
 
@@ -688,8 +793,14 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
     }
     let mut acc = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
-    if let Some(other) = accounts.iter().find(|a| a.id != id && a.name.eq_ignore_ascii_case(name)) {
-        return Err(trf("err.name.taken", &[("name", name), ("other", &other.name)]));
+    if let Some(other) = accounts
+        .iter()
+        .find(|a| a.id != id && a.name.eq_ignore_ascii_case(name))
+    {
+        return Err(trf(
+            "err.name.taken",
+            &[("name", name), ("other", &other.name)],
+        ));
     }
     acc.name = name.to_string();
     acc.updated_at = now_ts();
@@ -757,7 +868,9 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
                 is_active: same_login(live_login.as_ref(), a),
                 user_id: a.user_id.clone(),
                 nickname: a.nickname.clone(),
-                snapshot_ok: manifest::snapshot_root(&acc_dir).join("lobsterai.sqlite").is_file(),
+                snapshot_ok: manifest::snapshot_root(&acc_dir)
+                    .join("lobsterai.sqlite")
+                    .is_file(),
                 snapshot_size: manifest::snapshot_size(&acc_dir),
                 token_days_left: days_left(a.token_exp_ms),
                 token_exp_text: a.token_exp_ms.map(fmt_time_ms),

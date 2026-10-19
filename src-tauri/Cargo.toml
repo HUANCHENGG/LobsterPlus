@@ -45,7 +45,7 @@ ureq = { version = "2", features = ["tls"] }
 # mingw64 也无 libsqlite3）。编译坑：本机 mingw64 的 time.h 会引
 # pthread_time.h 而该头文件缺失——build.rs 给 cc 传 CFLAGS=-D_STRICT_STDC
 # 绕过（已实测：该宏下 time/localtime 等时间函数全部可用）。
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

@@ -14,9 +14,9 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 
 | 模块 | 职责 | 关键点 |
 |---|---|---|
-| `store.rs` | 账号库 + 切换编排 | 读回校验失败自动回滚；same_login 以 `auth_user.id` 为主键 |
-| `manifest.rs` | 目录快照交换引擎 | MANIFEST_PATHS / EXCLUDED_PATHS 两张清单；串号防线=restore 时清 live 残留 |
-| `kvdb.rs` | lobsterai.sqlite kv 读写 | live 库只读红线；write 仅限客户端退出后的续期回写 |
+| `store.rs` | 账号库 + 收编/切换编排 | capture 在线只复制；switch 离线交换并读回校验，失败自动回滚 |
+| `manifest.rs` | 在线 staging 快照 + 离线目录交换 | required/optional 复制语义；restore 时清 live 残留防串号 |
+| `kvdb.rs` | lobsterai.sqlite kv 读写与在线备份 | SQLite Backup API 包含活跃 WAL；live 写仅限客户端退出后的续期回写 |
 | `checkin.rs` | 签到三步 HTTP + token 续期 | 51102=登录失效；51104=已签（幂等）；1h 节流 |
 | `guard.rs` | LobsterAI.exe 进程管理 | 优雅关闭=taskkill 不带 /F（WAL 落盘）；Electron 多进程全退才继续 |
 | `proxy.rs` | Python 代理生命周期 | include_str! 内嵌脚本；.released-tag 版本标记自动更新；config.json 只在缺失时写 |
@@ -36,8 +36,8 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 
 ## 修改守则
 
-1. **绝不在客户端运行时写 live lobsterai.sqlite**（WAL 竞态会损坏数据）。切换/收编前必须 `guard::close_lobster_graceful`。
-2. **manifest 改动必须跑 `manifest_conflicts` 单测**（manifest 与 EXCLUDED 不得重叠）并补 roundtrip 测试。
+1. **绝不在客户端运行时写 live lobsterai.sqlite**（WAL 竞态会损坏数据）。`capture` 不关闭或重启客户端：主库必须用 SQLite Backup API 复制到 staging，其他路径逐项在线复制，live 不移动；只有离线切换/sync_back 才先 `guard::close_lobster_graceful` 并移动目录。
+2. **manifest 改动必须跑 Rust 单测**（命令见“构建红线”）：保持 manifest/EXCLUDED 不重叠并补 roundtrip；在线收编中，当前存在的路径除 `DIPS-wal`/`DIPS-shm` 外均为 required，复制失败清理 staging 并整体失败，只有这两个瞬态 sidecar 可降级为 warning。
 3. 切换流程任何失败路径都要考虑回滚（读回校验失败 → rollback_from_backup）。
 4. CLI 新子命令：i18n.rs 补 usage 文案（zh/en 两份）；JSON 输出不得含 token/apiKey。
 5. `lobster_proxy.py` 是纯标准库脚本（Python 3.8+），禁止引第三方依赖；存储/schema 改动跑 `--selftest-storage`，协议或真实上游改动再跑 `--selftest`。
@@ -61,17 +61,3 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 4. **spawn 子进程必须显式重定向 stdio**：proxy start / launch 不置 null 会继承父进程管道，CLI 调用方永不返回（python subprocess 挂起）。
 5. **构建脚本 ASCII-only**：cmd 的 GBK 代码页下 UTF-8 中文注释会被当命令执行。
 6. **本机 PATH 的 `python.exe/python3.exe` 是 Windows Store App Execution Alias**：运行代理自检须显式使用 `%APPDATA%\LobsterAI\runtimes\python-win\python.exe`；Python 候选不能只以文件存在判有效，必须实际启动验证。
-
-## 实机验证状态（2026-09-28）
-
-| 功能 | 状态 |
-|---|---|
-| doctor 一键诊断 | ✅ 11 项全绿 |
-| 收编（capture） | ✅ 快照 15 项 + 加密 blob |
-| 全库签到（checkin） | ✅ 服务端返回"今日已签（累计 30 天）" |
-| API 代理 OpenAI 非流式/流式 | ✅ SSE 聚合正确（含 reasoning_content） |
-| API 代理 Anthropic /v1/messages | ✅ 协议转换 + 流式事件序列正确 |
-| proxy start/stop | ✅ 不再挂起 |
-| CC-Switch 注册（register） | ✅ apiFormat=anthropic、固定端口、备份+还原激活项 |
-| 切换（switch --force） | ✅ 杀进程 → 15 项保鲜 → 15 项恢复 → 读回校验通过（27s） |
-| A↔B 双账号往返 | ⏳ 待第二账号收编后验证 |

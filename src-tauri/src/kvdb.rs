@@ -9,9 +9,10 @@
 //! - 写必须在客户端进程已退出后进行（wal 模式下写会自动恢复 wal 内容）；
 //! - live 库是切换引擎 manifest 的一部分，整体随快照交换。
 
-use rusqlite::Connection;
+use rusqlite::{backup::Backup, Connection};
 use serde_json::Value;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const KEY_AUTH_TOKENS: &str = "auth_tokens";
@@ -21,6 +22,65 @@ pub const KEY_KEYFROM: &str = "keyfrom.attribution.v1";
 pub const KEY_INSTALL_UUID: &str = "installation_uuid";
 pub const KEY_SIDEBAR_BANNER_V2: &str = "client_sidebar_banner.schedule.desktop_sidebar.v2";
 pub const KEY_SIDEBAR_BANNER_V1: &str = "client_sidebar_banner.schedule.desktop_sidebar.v1";
+
+/// 使用 SQLite Backup API 创建一致的在线副本；源库处于 WAL 模式且有活跃连接时也安全。
+pub fn backup_online(source: &Path, destination: &Path) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!("数据库不存在：{}", source.display()));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建备份目录失败 {}: {e}", parent.display()))?;
+    }
+    if destination.exists() {
+        fs::remove_file(destination)
+            .map_err(|e| format!("清理旧备份失败 {}: {e}", destination.display()))?;
+    }
+    let source_conn = Connection::open_with_flags(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("打开源数据库失败 {}: {e}", source.display()))?;
+    source_conn
+        .busy_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("设置源数据库 busy timeout 失败：{e}"))?;
+    let mut destination_conn = Connection::open(destination)
+        .map_err(|e| format!("创建备份数据库失败 {}: {e}", destination.display()))?;
+    destination_conn
+        .busy_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("设置备份数据库 busy timeout 失败：{e}"))?;
+    let backup = Backup::new(&source_conn, &mut destination_conn)
+        .map_err(|e| format!("初始化在线备份失败：{e}"))?;
+    backup
+        .run_to_completion(128, Duration::from_millis(10), None)
+        .map_err(|e| format!("在线备份失败：{e}"))?;
+    drop(backup);
+    drop(destination_conn);
+    let verify = Connection::open_with_flags(
+        destination,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("重新打开备份数据库失败 {}: {e}", destination.display()))?;
+    verify
+        .busy_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("设置备份验证 busy timeout 失败：{e}"))?;
+    let check: String = verify
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|e| format!("验证备份数据库失败：{e}"))?;
+    if check != "ok" {
+        return Err(format!("备份数据库完整性检查失败：{check}"));
+    }
+    drop(verify);
+    // 只读验证可能根据源库持久化 journal_mode 创建空 sidecar；快照只需主库。
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", destination.display()));
+        if sidecar.exists() {
+            fs::remove_file(&sidecar)
+                .map_err(|e| format!("清理备份数据库 sidecar {} 失败：{e}", sidecar.display()))?;
+        }
+    }
+    Ok(())
+}
 
 fn conn_read(db: &Path) -> Result<Connection, String> {
     if !db.is_file() {
@@ -47,7 +107,10 @@ fn read_kv_raw_conn(c: &Connection, key: &str) -> Result<Option<String>, String>
         .map_err(|e| format!("查询失败：{e}"))?;
     let mut rows = stmt.query([key]).map_err(|e| format!("查询失败：{e}"))?;
     match rows.next().map_err(|e| format!("查询失败：{e}"))? {
-        Some(row) => Ok(Some(row.get::<_, String>(0).map_err(|e| format!("读取失败：{e}"))?)),
+        Some(row) => Ok(Some(
+            row.get::<_, String>(0)
+                .map_err(|e| format!("读取失败：{e}"))?,
+        )),
         None => Ok(None),
     }
 }
@@ -62,8 +125,16 @@ pub fn read_kv_json(db: &Path, key: &str) -> Result<Option<Value>, String> {
 pub fn read_auth_tokens(db: &Path) -> Result<Option<(String, String)>, String> {
     let v = read_kv_json(db, KEY_AUTH_TOKENS)?;
     let Some(v) = v else { return Ok(None) };
-    let access = v.get("accessToken").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let refresh = v.get("refreshToken").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let access = v
+        .get("accessToken")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let refresh = v
+        .get("refreshToken")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if access.is_empty() {
         return Ok(None);
     }
@@ -123,15 +194,25 @@ pub fn read_server_base(db: &Path, prod: &str, test: &str) -> Result<String, Str
         .and_then(|a| a.get("testMode"))
         .and_then(|t| t.as_bool())
         .unwrap_or(false);
-    Ok(if test_mode { test.to_string() } else { prod.to_string() })
+    Ok(if test_mode {
+        test.to_string()
+    } else {
+        prod.to_string()
+    })
 }
 
 /// 签到 token 续期请求的辅助字段（firstKeyfrom/latestKeyfrom/uuid/userId/version）。
 pub fn read_refresh_payload(db: &Path, client_version: &str) -> RefreshPayload {
     let mut p = RefreshPayload::default();
     if let Ok(Some(v)) = read_kv_json(db, KEY_KEYFROM) {
-        p.first_keyfrom = v.get("firstKeyfrom").and_then(|x| x.as_str()).map(String::from);
-        p.latest_keyfrom = v.get("latestKeyfrom").and_then(|x| x.as_str()).map(String::from);
+        p.first_keyfrom = v
+            .get("firstKeyfrom")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        p.latest_keyfrom = v
+            .get("latestKeyfrom")
+            .and_then(|x| x.as_str())
+            .map(String::from);
     }
     p.uuid = read_kv_value_as_string(db, KEY_INSTALL_UUID);
     if let Ok(Some(v)) = read_kv_json(db, KEY_AUTH_USER) {
@@ -261,6 +342,34 @@ mod tests {
         // 其他 key 不受影响
         assert_eq!(read_user_id(&db).unwrap().as_deref(), Some("uid-9"));
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn online_backup_includes_uncheckpointed_wal_with_active_connection() {
+        let dir = std::env::temp_dir().join(format!("lp-backup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.sqlite");
+        let destination = dir.join("snapshot.sqlite");
+        let writer = Connection::open(&source).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute_batch("CREATE TABLE items(value TEXT); INSERT INTO items VALUES ('wal-row');")
+            .unwrap();
+        assert!(source.with_extension("sqlite-wal").exists());
+
+        backup_online(&source, &destination).unwrap();
+
+        let copied: String = Connection::open(&destination)
+            .unwrap()
+            .query_row("SELECT value FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(copied, "wal-row");
+        writer
+            .execute("INSERT INTO items VALUES ('still-live')", [])
+            .unwrap();
+        drop(writer);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
