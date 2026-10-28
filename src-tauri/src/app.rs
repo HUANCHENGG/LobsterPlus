@@ -61,7 +61,11 @@ fn delete_account(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn switch_to(id: String, force: bool, restart: Option<bool>) -> Result<store::SwitchResult, String> {
+fn switch_to(
+    id: String,
+    force: bool,
+    restart: Option<bool>,
+) -> Result<store::SwitchResult, String> {
     let _guard = store_guard();
     let paths = Paths::detect();
     let settings = store::load_settings(&paths);
@@ -103,9 +107,7 @@ async fn pick_lobster_path(app: AppHandle) -> Result<Value, String> {
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };
-    let path = fp
-        .into_path()
-        .map_err(|e| format!("{e}"))?;
+    let path = fp.into_path().map_err(|e| format!("{e}"))?;
     Ok(json!({ "picked": true, "path": path.to_string_lossy() }))
 }
 

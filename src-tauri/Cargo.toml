@@ -26,7 +26,10 @@ gui = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-single-instance
 # 固定 tauri 2.11.x：对齐 TraePlus 已实机验证的依赖树（2.12 引入的
 # webview2-com-sys 0.39 在本机 Windows Server 17763 上测试 exe 报
 # STATUS_ENTRYPOINT_NOT_FOUND，0.38.2 正常）
-tauri = { version = "=2.11.6", features = [], optional = true }
+# custom-protocol 是 release 构建必须项：tauri 的 build.rs 以
+# `dev = !has_feature("custom-protocol")` 判定模式，缺它就永远走 devUrl
+# （127.0.0.1:5177），vite 未启动时 WebView 报 chrome-error 白屏。
+tauri = { version = "=2.11.6", features = ["custom-protocol"], optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
