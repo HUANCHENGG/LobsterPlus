@@ -48,7 +48,12 @@ fn local_date(ms: i64) -> String {
 
 // ---------- HTTP ----------
 
-fn request(method: &str, url: &str, token: Option<&str>, body: Option<&Value>) -> Result<(u16, Value), String> {
+fn request(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+) -> Result<(u16, Value), String> {
     let req = match method {
         "GET" => ureq::get(url),
         _ => ureq::post(url),
@@ -72,7 +77,8 @@ fn request(method: &str, url: &str, token: Option<&str>, body: Option<&Value>) -
         Ok(r) => {
             let code = r.status();
             let text = r.into_string().unwrap_or_default();
-            let v = serde_json::from_str(&text).unwrap_or_else(|_| json!({"code": code, "message": text}));
+            let v = serde_json::from_str(&text)
+                .unwrap_or_else(|_| json!({"code": code, "message": text}));
             Ok((code, v))
         }
         Err(ureq::Error::Status(code, r)) => {
@@ -89,7 +95,11 @@ fn request(method: &str, url: &str, token: Option<&str>, body: Option<&Value>) -
 
 /// 解析账号可用 token。返回 (access_token, server_base)。
 /// 活跃账号优先 live sqlite；blob 临期自动续期。
-fn get_account_token(paths: &Paths, acc: &Account, is_active: bool) -> Result<(String, String), String> {
+fn get_account_token(
+    paths: &Paths,
+    acc: &Account,
+    is_active: bool,
+) -> Result<(String, String), String> {
     let live_db = paths.live_db();
     let secret = paths.secret();
 
@@ -146,7 +156,8 @@ fn get_account_token(paths: &Paths, acc: &Account, is_active: bool) -> Result<(S
 }
 
 fn resolve_server_base(db: &std::path::Path) -> String {
-    crate::kvdb::read_server_base(db, PROD_BASE, TEST_BASE).unwrap_or_else(|_| PROD_BASE.to_string())
+    crate::kvdb::read_server_base(db, PROD_BASE, TEST_BASE)
+        .unwrap_or_else(|_| PROD_BASE.to_string())
 }
 
 fn blob_server_base(_blob: &AuthBlob) -> String {
@@ -155,7 +166,12 @@ fn blob_server_base(_blob: &AuthBlob) -> String {
 }
 
 /// 用 refreshToken 续期。成功后回写账号 blob（+ 快照 sqlite，客户端退出时）。
-fn refresh_tokens(paths: &Paths, acc: &Account, blob: &AuthBlob, is_active: bool) -> Result<String, String> {
+fn refresh_tokens(
+    paths: &Paths,
+    acc: &Account,
+    blob: &AuthBlob,
+    is_active: bool,
+) -> Result<String, String> {
     if blob.refresh_token.is_empty() {
         return Err("登录态缺 refreshToken，请重新登录客户端后收编".into());
     }
@@ -173,17 +189,34 @@ fn refresh_tokens(paths: &Paths, acc: &Account, blob: &AuthBlob, is_active: bool
     if let Some(v) = &blob.user_id {
         obj.insert("userId".into(), json!(v));
     }
-    let cv = blob.version.clone().unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_string());
+    let cv = blob
+        .version
+        .clone()
+        .unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_string());
     obj.insert("version".into(), json!(cv));
 
     let base = blob_server_base(blob);
-    let (_status, resp) = request("POST", &format!("{base}/api/auth/refresh"), None, Some(&body))?;
+    let (_status, resp) = request(
+        "POST",
+        &format!("{base}/api/auth/refresh"),
+        None,
+        Some(&body),
+    )?;
     let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     let data = resp.get("data").cloned().unwrap_or(Value::Null);
-    let new_access = data.get("accessToken").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let new_access = data
+        .get("accessToken")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
     if code != 0 || new_access.is_empty() {
-        let msg = resp.get("message").and_then(|m| m.as_str()).unwrap_or("未知错误");
-        return Err(format!("令牌续期失败（code={code}）：{msg}。请切回该账号在客户端重新登录"));
+        let msg = resp
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!(
+            "令牌续期失败（code={code}）：{msg}。请切回该账号在客户端重新登录"
+        ));
     }
     let new_refresh = data
         .get("refreshToken")
@@ -210,7 +243,8 @@ fn refresh_tokens(paths: &Paths, acc: &Account, blob: &AuthBlob, is_active: bool
     }
     // 活跃账号且客户端不在运行：回写快照 sqlite，客户端下次启动直接用新 token
     if is_active && !crate::guard::lobster_running(paths) {
-        let snap_db = crate::manifest::snapshot_root(&paths.account_dir(&acc.id)).join("lobsterai.sqlite");
+        let snap_db =
+            crate::manifest::snapshot_root(&paths.account_dir(&acc.id)).join("lobsterai.sqlite");
         if snap_db.is_file() {
             let _ = crate::kvdb::write_auth_tokens(&snap_db, &new_access, &new_refresh);
         }
@@ -228,7 +262,11 @@ pub fn checkin_one(paths: &Paths, acc: &Account, is_active: bool) -> (String, St
         let mut last = LAST_ATTEMPT.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((id, t)) = last.as_ref() {
             if *id == acc.id && now_ms() - *t < PER_ACCOUNT_THROTTLE_MS {
-                return ("skip".into(), "1 小时内已尝试过，跳过（每小时自动补签会重试）".into(), Value::Null);
+                return (
+                    "skip".into(),
+                    "1 小时内已尝试过，跳过（每小时自动补签会重试）".into(),
+                    Value::Null,
+                );
             }
         }
         *last = Some((acc.id.clone(), now_ms()));
@@ -239,7 +277,11 @@ pub fn checkin_one(paths: &Paths, acc: &Account, is_active: bool) -> (String, St
         Err(e) => return ("error".into(), e, Value::Null),
     };
     if token.is_empty() {
-        return ("error".into(), "登录态无 token（可能已登出，请重新收编）".into(), Value::Null);
+        return (
+            "error".into(),
+            "登录态无 token（可能已登出，请重新收编）".into(),
+            Value::Null,
+        );
     }
 
     let client_version = acc
@@ -248,7 +290,13 @@ pub fn checkin_one(paths: &Paths, acc: &Account, is_active: bool) -> (String, St
         .and_then(|enc| store::decode_auth_blob(enc, &paths.secret()).ok())
         .and_then(|b| b.version.filter(|v| !v.is_empty()))
         .unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_string());
-    let platform = if cfg!(windows) { "win32" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" };
+    let platform = if cfg!(windows) {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
 
     // 1) 活动位
     let slot_url = format!(
@@ -260,35 +308,74 @@ pub fn checkin_one(paths: &Paths, acc: &Account, is_active: bool) -> (String, St
     };
     let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code == 51102 {
-        return ("error".into(), "登录已失效（51102），请切回该账号在客户端重新登录".into(), Value::Null);
+        return (
+            "error".into(),
+            "登录已失效（51102），请切回该账号在客户端重新登录".into(),
+            Value::Null,
+        );
     }
     if code != 0 {
-        let msg = resp.get("message").and_then(|m| m.as_str()).unwrap_or("未知错误");
-        return ("error".into(), format!("活动位查询失败（code={code}）：{msg}"), Value::Null);
+        let msg = resp
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return (
+            "error".into(),
+            format!("活动位查询失败（code={code}）：{msg}"),
+            Value::Null,
+        );
     }
     let activity = resp
         .pointer("/data/activity")
         .cloned()
         .unwrap_or(Value::Null);
-    let activity_code = activity.get("activityCode").and_then(|c| c.as_str()).unwrap_or("");
-    let revision = activity.get("configRevision").and_then(|c| c.as_i64()).unwrap_or(0);
+    let activity_code = activity
+        .get("activityCode")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let revision = activity
+        .get("configRevision")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
     if activity_code.is_empty() {
-        return ("no_activity".into(), "当前没有可参与的签到活动".into(), Value::Null);
+        return (
+            "no_activity".into(),
+            "当前没有可参与的签到活动".into(),
+            Value::Null,
+        );
     }
 
     // 2) 活动上下文（claimedToday 预检）
-    let ctx_url = format!("{base}/api/client-activities/{activity_code}/context?configRevision={revision}");
+    let ctx_url =
+        format!("{base}/api/client-activities/{activity_code}/context?configRevision={revision}");
     let (_s, resp) = match request("GET", &ctx_url, Some(&token), None) {
         Ok(v) => v,
-        Err(e) => return ("error".into(), format!("活动状态查询失败：{e}"), Value::Null),
+        Err(e) => {
+            return (
+                "error".into(),
+                format!("活动状态查询失败：{e}"),
+                Value::Null,
+            )
+        }
     };
     let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        let msg = resp.get("message").and_then(|m| m.as_str()).unwrap_or("未知错误");
-        return ("error".into(), format!("活动状态查询失败（code={code}）：{msg}"), Value::Null);
+        let msg = resp
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return (
+            "error".into(),
+            format!("活动状态查询失败（code={code}）：{msg}"),
+            Value::Null,
+        );
     }
     let state = resp.pointer("/data/state").cloned().unwrap_or(Value::Null);
-    if state.get("claimedToday").and_then(|c| c.as_bool()).unwrap_or(false) {
+    if state
+        .get("claimedToday")
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false)
+    {
         let days = state.get("claimedDays").cloned().unwrap_or(Value::Null);
         let credits = state.get("claimedCredits").cloned().unwrap_or(Value::Null);
         return (
@@ -315,12 +402,28 @@ pub fn checkin_one(paths: &Paths, acc: &Account, is_active: bool) -> (String, St
         return ("done".into(), "今日已签到".into(), Value::Null);
     }
     if code != 0 {
-        let msg = resp.get("message").and_then(|m| m.as_str()).unwrap_or("未知错误");
-        return ("error".into(), format!("签到失败（code={code}）：{msg}"), Value::Null);
+        let msg = resp
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return (
+            "error".into(),
+            format!("签到失败（code={code}）：{msg}"),
+            Value::Null,
+        );
     }
-    let granted = resp.pointer("/data/result/creditsGranted").and_then(|c| c.as_i64()).unwrap_or(0);
-    let days = resp.pointer("/data/context/state/claimedDays").and_then(|c| c.as_i64()).unwrap_or(0);
-    let credits = resp.pointer("/data/context/state/claimedCredits").and_then(|c| c.as_i64()).unwrap_or(0);
+    let granted = resp
+        .pointer("/data/result/creditsGranted")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    let days = resp
+        .pointer("/data/context/state/claimedDays")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    let credits = resp
+        .pointer("/data/context/state/claimedCredits")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
     (
         "ok".into(),
         format!("签到成功！+{granted} 积分（累计 {days} 天 / 共 {credits} 积分）"),
@@ -354,7 +457,10 @@ pub fn checkin_all(paths: &Paths, only_id: Option<&str>) -> Result<Value, String
                 continue;
             }
         }
-        let is_active = live_login.as_ref().map(|l| !acc.user_id.is_empty() && l.user_id == acc.user_id).unwrap_or(false);
+        let is_active = live_login
+            .as_ref()
+            .map(|l| !acc.user_id.is_empty() && l.user_id == acc.user_id)
+            .unwrap_or(false);
         let (status, msg, data) = checkin_one(paths, acc, is_active);
         if status == "ok" || status == "done" {
             record_checkin(paths, acc, &status, &msg, data.clone());
@@ -368,7 +474,10 @@ pub fn checkin_all(paths: &Paths, only_id: Option<&str>) -> Result<Value, String
         }));
     }
     if let Some(id) = only_id {
-        if !results.iter().any(|r| r.get("id").and_then(|v| v.as_str()) == Some(id)) {
+        if !results
+            .iter()
+            .any(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
+        {
             return Err(format!("账号不存在：{id}"));
         }
     }
@@ -385,7 +494,8 @@ pub fn checkin_all(paths: &Paths, only_id: Option<&str>) -> Result<Value, String
 pub fn needs_checkin(acc: &Account) -> bool {
     match acc.last_checkin.as_ref() {
         Some(c) => {
-            let today_ok = c.get("date").and_then(|d| d.as_str()) == Some(local_date(now_ms()).as_str())
+            let today_ok = c.get("date").and_then(|d| d.as_str())
+                == Some(local_date(now_ms()).as_str())
                 && matches!(
                     c.get("status").and_then(|s| s.as_str()),
                     Some("ok") | Some("done") | Some("no_activity")
@@ -406,7 +516,10 @@ pub fn catchup(paths: &Paths) -> Result<Value, String> {
     let live_login = store::read_live_login(paths).ok().flatten();
     let mut results = vec![];
     for acc in todo {
-        let is_active = live_login.as_ref().map(|l| !acc.user_id.is_empty() && l.user_id == acc.user_id).unwrap_or(false);
+        let is_active = live_login
+            .as_ref()
+            .map(|l| !acc.user_id.is_empty() && l.user_id == acc.user_id)
+            .unwrap_or(false);
         let (status, msg, data) = checkin_one(paths, acc, is_active);
         if status == "ok" || status == "done" || status == "no_activity" {
             record_checkin(paths, acc, &status, &msg, data.clone());

@@ -19,7 +19,11 @@ impl ProxyLock {
         PathBuf::from(s)
     }
 
-    pub fn acquire(marker: &Path, timeout: Duration, stale_after: Duration) -> Result<ProxyLock, String> {
+    pub fn acquire(
+        marker: &Path,
+        timeout: Duration,
+        stale_after: Duration,
+    ) -> Result<ProxyLock, String> {
         let path = Self::path_of(marker);
         let deadline = Instant::now() + timeout;
         loop {
@@ -75,11 +79,13 @@ mod tests {
         let marker = dir.join("sqlite.db");
         std::fs::write(&marker, b"x").unwrap();
         {
-            let _l = ProxyLock::acquire(&marker, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+            let _l = ProxyLock::acquire(&marker, Duration::from_secs(1), Duration::from_secs(1))
+                .unwrap();
             assert!(ProxyLock::path_of(&marker).exists());
         }
         // 释放后可重新获取
-        let _ = ProxyLock::acquire(&marker, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let _ =
+            ProxyLock::acquire(&marker, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
         assert!(!ProxyLock::path_of(&marker).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

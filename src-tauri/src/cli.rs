@@ -114,10 +114,13 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             if has_flag(rest, "--dry-run") {
                 let live = paths.live_dir();
-                return (ok(json!({
-                    "live_dir": live.to_string_lossy(),
-                    "manifest_existing": crate::manifest::live_manifest_paths(&live),
-                })), 0);
+                return (
+                    ok(json!({
+                        "live_dir": live.to_string_lossy(),
+                        "manifest_existing": crate::manifest::live_manifest_paths(&live),
+                    })),
+                    0,
+                );
             }
             let force = has_flag(rest, "--force");
             let settings = load_settings(&paths);
@@ -184,7 +187,10 @@ pub fn run(args: &[String]) -> (String, i32) {
         "launch" => {
             let (p, ok_path) = guard::effective_lobster_path(&paths);
             if !ok_path {
-                return (err(&crate::i18n::trf("err.lobster.missing", &[("path", &p)])), 1);
+                return (
+                    err(&crate::i18n::trf("err.lobster.missing", &[("path", &p)])),
+                    1,
+                );
             }
             match guard::launch_lobster(&p) {
                 Ok(()) => ok(json!({ "launched": p })),
@@ -198,7 +204,10 @@ pub fn run(args: &[String]) -> (String, i32) {
         },
         "setpath" => {
             let Some(p) = flag(rest, "--path") else {
-                return (err("用法：--cli setpath --path <LobsterAI.exe 完整路径>"), 2);
+                return (
+                    err("用法：--cli setpath --path <LobsterAI.exe 完整路径>"),
+                    2,
+                );
             };
             let mut s = load_settings(&paths);
             s.lobster_path = Some(p);
@@ -227,7 +236,12 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
-        other => return (err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])), 2),
+        other => {
+            return (
+                err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])),
+                2,
+            )
+        }
     };
     (out, 0)
 }
@@ -264,8 +278,7 @@ fn install_schedule(_paths: &Paths) -> Result<Value, String> {
     }
     let cmd = format!("\"{exe}\" --cli checkin");
     schtasks(&[
-        "/Create", "/TN", TASK_NAME, "/SC", "DAILY", "/ST", "09:00",
-        "/TR", &cmd, "/F",
+        "/Create", "/TN", TASK_NAME, "/SC", "DAILY", "/ST", "09:00", "/TR", &cmd, "/F",
     ])?;
     Ok(json!({ "installed": true, "task": TASK_NAME, "daily_at": "09:00", "command": cmd }))
 }
@@ -290,8 +303,16 @@ fn doctor(paths: &Paths) -> Value {
     // 数据目录
     let live = paths.live_dir();
     let db = paths.live_db();
-    items.push(("live_data_dir".into(), live.is_dir(), live.to_string_lossy().to_string()));
-    items.push(("live_sqlite".into(), db.is_file(), db.to_string_lossy().to_string()));
+    items.push((
+        "live_data_dir".into(),
+        live.is_dir(),
+        live.to_string_lossy().to_string(),
+    ));
+    items.push((
+        "live_sqlite".into(),
+        db.is_file(),
+        db.to_string_lossy().to_string(),
+    ));
 
     // 安装路径
     let (exe, exe_ok) = guard::effective_lobster_path(paths);
@@ -306,7 +327,11 @@ fn doctor(paths: &Paths) -> Value {
         Ok(Some(l)) => items.push((
             "live_login".into(),
             true,
-            format!("user_id={} nickname={}", l.user_id, l.nickname.unwrap_or_default()),
+            format!(
+                "user_id={} nickname={}",
+                l.user_id,
+                l.nickname.unwrap_or_default()
+            ),
         )),
         Ok(None) => items.push(("live_login".into(), false, "未登录".into())),
         Err(e) => items.push(("live_login".into(), false, e)),
@@ -314,11 +339,19 @@ fn doctor(paths: &Paths) -> Value {
 
     // 账号库
     let accounts = list_accounts(paths).unwrap_or_default();
-    items.push(("accounts".into(), true, format!("{} 个账号", accounts.len())));
+    items.push((
+        "accounts".into(),
+        true,
+        format!("{} 个账号", accounts.len()),
+    ));
 
     // 上游探测（LobsterAI 本地模型代理）
     let upstream = probe_upstream_summary();
-    items.push(("upstream_model_proxy".into(), upstream.1, upstream.2.clone()));
+    items.push((
+        "upstream_model_proxy".into(),
+        upstream.1,
+        upstream.2.clone(),
+    ));
     let _ = upstream;
 
     // 我们的代理
@@ -326,7 +359,10 @@ fn doctor(paths: &Paths) -> Value {
         Ok(st) => items.push((
             "lobsterplus_proxy".into(),
             st.running,
-            format!("running={} port={} upstream_alive={:?}", st.running, st.port, st.upstream_alive),
+            format!(
+                "running={} port={} upstream_alive={:?}",
+                st.running, st.port, st.upstream_alive
+            ),
         )),
         Err(e) => items.push(("lobsterplus_proxy".into(), false, e)),
     }
@@ -336,27 +372,39 @@ fn doctor(paths: &Paths) -> Value {
     items.push((
         "python".into(),
         py.is_some(),
-        py.map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "未找到".into()),
+        py.map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未找到".into()),
     ));
 
     // CC-Switch
     let ccs = cc_switch_db_path();
     let ccs_ok = ccs.is_file();
-    items.push(("cc_switch_db".into(), ccs_ok, ccs.to_string_lossy().to_string()));
+    items.push((
+        "cc_switch_db".into(),
+        ccs_ok,
+        ccs.to_string_lossy().to_string(),
+    ));
 
     // 计划任务
     let sched = schedule_status();
     items.push((
         "daily_checkin_task".into(),
         true,
-        if sched["installed"].as_bool().unwrap_or(false) { "已安装（每日 09:00）".into() } else { "未安装".into() },
+        if sched["installed"].as_bool().unwrap_or(false) {
+            "已安装（每日 09:00）".into()
+        } else {
+            "未安装".into()
+        },
     ));
 
     let checks: Vec<Value> = items
         .into_iter()
         .map(|(k, ok, detail)| json!({ "item": k, "ok": ok, "detail": detail }))
         .collect();
-    let all_ok = checks.iter().filter(|c| c["ok"].as_bool().unwrap_or(false)).count();
+    let all_ok = checks
+        .iter()
+        .filter(|c| c["ok"].as_bool().unwrap_or(false))
+        .count();
     json!({ "checks": checks, "ok_count": all_ok, "total": checks.len() })
 }
 
@@ -364,7 +412,13 @@ fn probe_upstream_summary() -> (String, bool, String) {
     // 复用 Python 代理的探测逻辑路径：读两个候选文件
     let live = Paths::detect().live_dir();
     let mut cands = vec![];
-    let mf = live.join("openclaw").join("state").join("agents").join("main").join("agent").join("models.json");
+    let mf = live
+        .join("openclaw")
+        .join("state")
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("models.json");
     if let Ok(s) = std::fs::read_to_string(&mf) {
         if let Ok(v) = serde_json::from_str::<Value>(&s) {
             if let Some(provs) = v.get("providers").and_then(|p| p.as_object()) {

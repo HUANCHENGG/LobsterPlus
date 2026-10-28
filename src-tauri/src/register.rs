@@ -56,7 +56,9 @@ fn save_json_file(p: &std::path::Path, v: &Value) -> Result<(), String> {
 
 fn get_current_provider_id() -> Option<String> {
     let v = load_json_file(&cc_switch_settings());
-    v.get("currentProviderClaude").and_then(|x| x.as_str()).map(String::from)
+    v.get("currentProviderClaude")
+        .and_then(|x| x.as_str())
+        .map(String::from)
 }
 
 fn set_current_provider_id(pid: &str) -> Result<(), String> {
@@ -64,7 +66,9 @@ fn set_current_provider_id(pid: &str) -> Result<(), String> {
     if !v.is_object() {
         v = json!({});
     }
-    v.as_object_mut().unwrap().insert("currentProviderClaude".into(), json!(pid));
+    v.as_object_mut()
+        .unwrap()
+        .insert("currentProviderClaude".into(), json!(pid));
     save_json_file(&cc_switch_settings(), &v)
 }
 
@@ -82,7 +86,10 @@ pub fn register(paths: &Paths, make_current: bool) -> Result<Value, String> {
 
     let db = cc_switch_db();
     if !db.is_file() {
-        return Err(crate::i18n::trf("err.register.no_db", &[("path", &db.display().to_string())]));
+        return Err(crate::i18n::trf(
+            "err.register.no_db",
+            &[("path", &db.display().to_string())],
+        ));
     }
 
     // 记住写入前的当前 provider（写后还原，避免破坏现有使用）
@@ -127,8 +134,11 @@ pub fn register(paths: &Paths, make_current: bool) -> Result<Value, String> {
                     ],
                 )
                 .map_err(|e| format!("更新 provider 失败：{e}"))?;
-                c.execute("DELETE FROM provider_endpoints WHERE provider_id=?1", [&pid])
-                    .map_err(|e| format!("更新端点失败：{e}"))?;
+                c.execute(
+                    "DELETE FROM provider_endpoints WHERE provider_id=?1",
+                    [&pid],
+                )
+                .map_err(|e| format!("更新端点失败：{e}"))?;
                 pid
             }
             None => {
@@ -181,8 +191,11 @@ pub fn register(paths: &Paths, make_current: bool) -> Result<Value, String> {
 
 fn set_db_current(pid: &str) -> Result<(), String> {
     let c = Connection::open(cc_switch_db()).map_err(|e| format!("打开 cc-switch.db 失败：{e}"))?;
-    c.execute("UPDATE providers SET is_current=0 WHERE app_type='claude'", [])
-        .map_err(|e| format!("清除当前标记失败：{e}"))?;
+    c.execute(
+        "UPDATE providers SET is_current=0 WHERE app_type='claude'",
+        [],
+    )
+    .map_err(|e| format!("清除当前标记失败：{e}"))?;
     c.execute(
         "UPDATE providers SET is_current=1 WHERE id=?1 AND app_type='claude'",
         [pid],
@@ -210,13 +223,21 @@ fn build_env(base_url: &str, token: &str, model: &str) -> Value {
 fn default_upstream_model() -> Option<String> {
     let port = proxy::listen_port(&crate::store::Paths::detect());
     let url = format!("http://127.0.0.1:{port}/health");
-    let resp = ureq::get(&url).timeout(std::time::Duration::from_millis(1500)).call().ok()?;
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_millis(1500))
+        .call()
+        .ok()?;
     let body = resp.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
     let models: Vec<String> = v
         .get("models")
         .and_then(|m| m.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str()).map(String::from).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
     models
         .iter()

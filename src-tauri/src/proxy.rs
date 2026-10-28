@@ -41,14 +41,25 @@ pub fn ensure_released(paths: &Paths) -> Result<PathBuf, String> {
     let tag = &format!("{SCRIPT_TAG}:{}", script_tag());
     let need_update = fs::read_to_string(&tag_file).ok().as_deref() != Some(tag);
     if need_update {
-        fs::write(&script, PROXY_SCRIPT)
-            .map_err(|e| trf("err.write_file", &[("path", &script.display().to_string()), ("e", &e.to_string())]))?;
+        fs::write(&script, PROXY_SCRIPT).map_err(|e| {
+            trf(
+                "err.write_file",
+                &[
+                    ("path", &script.display().to_string()),
+                    ("e", &e.to_string()),
+                ],
+            )
+        })?;
         let _ = fs::write(&tag_file, tag);
     }
     let cfg = paths.proxy_config();
     if !cfg.exists() {
-        fs::write(&cfg, PROXY_CONFIG_TEMPLATE)
-            .map_err(|e| trf("err.write_file", &[("path", &cfg.display().to_string()), ("e", &e.to_string())]))?;
+        fs::write(&cfg, PROXY_CONFIG_TEMPLATE).map_err(|e| {
+            trf(
+                "err.write_file",
+                &[("path", &cfg.display().to_string()), ("e", &e.to_string())],
+            )
+        })?;
     }
     Ok(dir)
 }
@@ -83,32 +94,57 @@ pub fn api_key(paths: &Paths) -> Option<String> {
     let cfg = paths.proxy_config();
     let raw = fs::read_to_string(&cfg).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
-    let key = v.get("api_key").and_then(|p| p.as_str())?.trim().to_string();
+    let key = v
+        .get("api_key")
+        .and_then(|p| p.as_str())?
+        .trim()
+        .to_string();
     (!key.is_empty()).then_some(key)
 }
 
 /// GET /health 探测。running=true 要求返回 JSON 且 status=="ok"。
 pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
     if in_sandbox() {
-        return Ok(ProxyStatus { running: false, port: DEFAULT_PORT, foreign: false, upstream_alive: None, upstream: None });
+        return Ok(ProxyStatus {
+            running: false,
+            port: DEFAULT_PORT,
+            foreign: false,
+            upstream_alive: None,
+            upstream: None,
+        });
     }
     let port = listen_port(paths);
     let url = format!("http://127.0.0.1:{port}/health");
     let resp = ureq::get(&url).timeout(HEALTH_TIMEOUT).call();
     let Some(resp) = resp.ok() else {
-        return Ok(ProxyStatus { running: false, port, foreign: false, upstream_alive: None, upstream: None });
+        return Ok(ProxyStatus {
+            running: false,
+            port,
+            foreign: false,
+            upstream_alive: None,
+            upstream: None,
+        });
     };
     let body = resp.into_string().unwrap_or_default();
     match serde_json::from_str::<Value>(&body) {
         Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("ok") => {
             let upstream_alive = v.get("upstream_alive").and_then(|x| x.as_bool());
-            let upstream = v
-                .get("upstream")
-                .and_then(|x| x.as_str())
-                .map(String::from);
-            Ok(ProxyStatus { running: true, port, foreign: false, upstream_alive, upstream })
+            let upstream = v.get("upstream").and_then(|x| x.as_str()).map(String::from);
+            Ok(ProxyStatus {
+                running: true,
+                port,
+                foreign: false,
+                upstream_alive,
+                upstream,
+            })
         }
-        _ => Ok(ProxyStatus { running: false, port, foreign: true, upstream_alive: None, upstream: None }),
+        _ => Ok(ProxyStatus {
+            running: false,
+            port,
+            foreign: true,
+            upstream_alive: None,
+            upstream: None,
+        }),
     }
 }
 
@@ -165,8 +201,12 @@ pub fn start(paths: &Paths) -> Result<ProxyStatus, String> {
         return Err(tr("err.proxy.no_python"));
     };
     let log = paths.proxy_log();
-    let log_file = fs::File::create(&log)
-        .map_err(|e| trf("err.write_file", &[("path", &log.display().to_string()), ("e", &e.to_string())]))?;
+    let log_file = fs::File::create(&log).map_err(|e| {
+        trf(
+            "err.write_file",
+            &[("path", &log.display().to_string()), ("e", &e.to_string())],
+        )
+    })?;
 
     let mut cmd = std::process::Command::new(&py);
     cmd.args([script.as_os_str()]);
@@ -175,7 +215,9 @@ pub fn start(paths: &Paths) -> Result<ProxyStatus, String> {
     // 的 subprocess 挂到代理进程退出」——CLI proxy start 永不返回的根因。
     cmd.stdout(std::process::Stdio::from(log_file));
     cmd.stderr({
-        let e = fs::OpenOptions::new().append(true).open(&log)
+        let e = fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
             .or_else(|_| fs::File::create(&log));
         match e {
             Ok(f) => std::process::Stdio::from(f),
@@ -195,7 +237,11 @@ pub fn start(paths: &Paths) -> Result<ProxyStatus, String> {
         }
         if Instant::now() >= deadline {
             let tail = log_tail(paths, 15);
-            let extra = if tail.is_empty() { String::new() } else { format!("\n{}", trf("err.proxy.log_tail", &[("log", &tail)])) };
+            let extra = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", trf("err.proxy.log_tail", &[("log", &tail)]))
+            };
             return Err(tr("err.proxy.start_timeout") + &extra);
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -217,7 +263,12 @@ pub fn stop(paths: &Paths) -> Result<bool, String> {
         let mut sys = sysinfo::System::new();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         for (_pid, p) in sys.processes() {
-            let cmd = p.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+            let cmd = p
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
             if crate::guard::is_proxy_cmdline(&cmd) {
                 let _ = p.kill();
             }
@@ -275,7 +326,14 @@ pub fn log_tail(paths: &Paths, lines: usize) -> String {
         return String::from_utf8_lossy(&buf).to_string();
     }
     let text = String::from_utf8_lossy(&buf[..read_len]).to_string();
-    let tail: Vec<&str> = text.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: Vec<&str> = text
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     tail.join("\n")
 }
 
@@ -301,7 +359,10 @@ fn listener_pid(port: u16) -> Option<u32> {
     let needle = format!(":{port}");
     for line in text.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 5 && cols[0].eq_ignore_ascii_case("TCP") && cols[3].eq_ignore_ascii_case("LISTENING") {
+        if cols.len() >= 5
+            && cols[0].eq_ignore_ascii_case("TCP")
+            && cols[3].eq_ignore_ascii_case("LISTENING")
+        {
             if cols[1].ends_with(&needle) {
                 return cols[4].parse().ok();
             }
@@ -318,7 +379,10 @@ mod tests {
     fn embedded_files_present() {
         assert!(PROXY_SCRIPT.contains("ThreadingHTTPServer"), "内嵌脚本损坏");
         assert!(PROXY_SCRIPT.contains("UpstreamManager"), "稳定器缺失");
-        assert!(PROXY_CONFIG_TEMPLATE.contains("listen_port"), "内嵌配置模板损坏");
+        assert!(
+            PROXY_CONFIG_TEMPLATE.contains("listen_port"),
+            "内嵌配置模板损坏"
+        );
     }
 
     #[test]

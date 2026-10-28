@@ -6,13 +6,13 @@ pub mod cli;
 pub mod guard;
 pub mod i18n;
 pub mod kvdb;
+mod lockfile;
 pub mod manifest;
 pub mod proxy;
 pub mod register;
 pub mod store;
 pub mod usage;
 pub mod zcrypto;
-mod lockfile;
 
 #[cfg(feature = "gui")]
 mod app;

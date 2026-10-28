@@ -61,7 +61,10 @@ pub fn encrypt_with_secret(plain: &str, secret: &str) -> Result<String, String> 
     let ct = cipher
         .encrypt(
             &nonce,
-            Payload { msg: plain.as_bytes(), aad: b"lobster-plus:v1" },
+            Payload {
+                msg: plain.as_bytes(),
+                aad: b"lobster-plus:v1",
+            },
         )
         .map_err(|e| format!("加密失败：{e}"))?;
     // enc:v1:nonce.tag.ciphertext 格式（tag 单独拆出，与家族实现对称）
@@ -81,9 +84,15 @@ pub fn decrypt_with_secret(value: &str, secret: &str) -> Result<String, String> 
     if parts.len() != 3 {
         return Err("enc:v1 格式不正确".into());
     }
-    let nonce_b = URL_SAFE_NO_PAD.decode(parts[0]).map_err(|e| format!("nonce 解码失败：{e}"))?;
-    let tag_b = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|e| format!("tag 解码失败：{e}"))?;
-    let ct_b = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|e| format!("密文解码失败：{e}"))?;
+    let nonce_b = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| format!("nonce 解码失败：{e}"))?;
+    let tag_b = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| format!("tag 解码失败：{e}"))?;
+    let ct_b = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|e| format!("密文解码失败：{e}"))?;
     if nonce_b.len() != 12 {
         return Err("nonce 长度异常".into());
     }
@@ -94,7 +103,10 @@ pub fn decrypt_with_secret(value: &str, secret: &str) -> Result<String, String> 
     let pt = cipher
         .decrypt(
             Nonce::from_slice(&nonce_b),
-            Payload { msg: buf.as_slice(), aad: b"lobster-plus:v1" },
+            Payload {
+                msg: buf.as_slice(),
+                aad: b"lobster-plus:v1",
+            },
         )
         .map_err(|_| "解密失败（密钥不匹配或数据损坏）".to_string())?;
     Ok(String::from_utf8_lossy(&pt).to_string())

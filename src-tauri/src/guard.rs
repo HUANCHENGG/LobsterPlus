@@ -37,12 +37,20 @@ fn kill_all_impl(paths: &Paths) -> bool {
             continue;
         }
         // Electron 主进程之外，node/python 派生服务按命令行识别
-        let exe_lc = p.exe().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let exe_lc = p
+            .exe()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         if exe_lc.contains("lobsterai") {
             let _ = p.kill();
             continue;
         }
-        let cmd = p.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        let cmd = p
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         if is_lobster_child_cmdline(&cmd) {
             let _ = p.kill();
         }
@@ -66,7 +74,12 @@ fn any_lobster_left(paths: &Paths) -> bool {
         if is_lobster_name(&name) {
             return true;
         }
-        let cmd = p.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        let cmd = p
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         if is_lobster_child_cmdline(&cmd) {
             return true;
         }
@@ -88,7 +101,10 @@ pub struct LobsterProc {
 
 pub fn lobster_process(paths: &Paths) -> LobsterProc {
     if in_sandbox() {
-        return LobsterProc { running: false, exe: None };
+        return LobsterProc {
+            running: false,
+            exe: None,
+        };
     }
     let sys = refresh_system();
     let mut running = false;
@@ -204,7 +220,11 @@ pub fn lobster_path_candidates() -> Vec<String> {
 
 pub fn effective_lobster_path(paths: &Paths) -> (String, bool) {
     let settings = crate::store::load_settings(paths);
-    if let Some(p) = settings.lobster_path.as_ref().filter(|p| std::path::PathBuf::from(p).exists()) {
+    if let Some(p) = settings
+        .lobster_path
+        .as_ref()
+        .filter(|p| std::path::PathBuf::from(p).exists())
+    {
         return (p.clone(), true);
     }
     // 运行中的 LobsterAI 自己暴露安装路径
