@@ -6,7 +6,7 @@ use crate::guard;
 use crate::i18n;
 use crate::proxy;
 use crate::register;
-use crate::store::{self, Paths, Settings};
+use crate::store::{self, Paths};
 use crate::usage;
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -138,7 +138,7 @@ fn proxy_log() -> Result<Value, String> {
 #[tauri::command]
 fn proxy_usage(range: String) -> Result<usage::UsageReport, String> {
     let paths = Paths::detect();
-    usage::query(&paths.root.join("proxy").join("usage.sqlite"), &range)
+    usage::query(&paths.home.join("proxy").join("usage.sqlite"), &range)
 }
 
 #[tauri::command]
