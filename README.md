@@ -68,4 +68,12 @@ cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features   �
 "%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage   （用量存储自检）
 ```
 
+发布安装包（需本机已装 NSIS）：
+
+```
+npx tauri build --target x86_64-pc-windows-gnu
+```
+
+产物在 `src-tauri\target\x86_64-pc-windows-gnu\release\bundle\nsis\`。必须发安装包而不是裸 exe——裸 exe 依赖同目录的 `WebView2Loader.dll`，单独分发会启动失败。
+
 详见 [架构说明](docs/architecture.md)。

@@ -8,7 +8,10 @@ rem       cmd's default GBK code page when the file is saved as UTF-8.
 setlocal
 cd /d "%~dp0.."
 
-rem GNU toolchain needs mingw64 dlltool/ld (rustup default is stable-gnu)
+rem GNU toolchain needs mingw64 dlltool/ld (rustup default is MSVC, which
+rem has no working link.exe on this machine - Git's usr/bin/link.exe shadows
+rem any real MSVC linker and breaks every build script / proc-macro crate).
+set RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu
 set PATH=D:\mingw64\bin;%PATH%
 
 echo [1/2] vite build (frontend dist/)

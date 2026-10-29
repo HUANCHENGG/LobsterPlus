@@ -147,10 +147,13 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 
 ## 五、构建
 
-- 本机固定 GNU 工具链（MSVC 残缺）：`scripts\build-release.cmd`（PATH 前置 `D:\mingw64\bin` + `--features tauri/custom-protocol` 嵌入前端）。
+- 本机固定 GNU 工具链（无 VS，且 `C:\Program Files\Git\usr\bin\link.exe` 会抢占 MSVC 链接器、让 build script 全部链接失败）：`scripts\build-release.cmd`（`RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu` + `PATH=D:\mingw64\bin` + `--features tauri/custom-protocol` 嵌入前端）。
+- `custom-protocol` 是 release 必需项：tauri build.rs 以 `dev = !has_feature("custom-protocol")` 判定模式，缺它则不嵌入 `frontendDist`，WebView 改连 `devUrl`（127.0.0.1:5177），vite 未启动即 `chrome-error://chromewebdata/` 白屏；Vite 另需 `base: "./"`。
 - `[lib]` 只留 `rlib`（cdylib 超 MinGW ld 65535 符号上限）。
 - 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（含 Rust usage 只读查询；gui 层不进测试二进制）。
 - Python 用量存储自检（不访问真实上游）：`"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage`（schema/v1 迁移/WAL/聚合/失败/并发写入；本机 PATH 的 `python` 是 Windows Store alias，不可用）。
+- 发布：`npx tauri build --target x86_64-pc-windows-gnu`（需 NSIS）→ `bundle\nsis\LobsterPlus_<版本>_x64-setup.exe`。**只能发安装包**：exe 依赖同目录 `WebView2Loader.dll`，裸发会在未装 WebView2 运行时的机器上启动失败（v0.2.0 教训）。
+- 版本号需同步四处：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`。
 
 ## 六、E2E 验收清单
 

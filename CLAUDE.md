@@ -5,10 +5,11 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 
 ## 构建红线（必读）
 
-1. **本机必须走 GNU 工具链**（MSVC 链接环境残缺）：release 构建一律用 `scripts\build-release.cmd`（内部前置 `PATH=D:\mingw64\bin` 并带 `--features tauri/custom-protocol` 嵌入前端）。直接 `cargo build --release` 不带 custom-protocol 会产出连 127.0.0.1:5177 的废 exe。
+1. **本机必须走 GNU 工具链**（MSVC 残缺：无 VS，Git 自带 `usr\bin\link.exe` 会抢占并让所有 build script / proc-macro 链接失败）：release 构建一律用 `scripts\build-release.cmd`（内部 `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu` + `PATH=D:\mingw64\bin`，并带 `--features tauri/custom-protocol` 嵌入前端）。直接 `cargo build --release` 不带 custom-protocol 会产出连 127.0.0.1:5177 的废 exe；不指定 GNU 工具链则链接阶段直接失败。
 2. **`[lib]` 只留 `rlib`**：cdylib 会被 MinGW 链成 DLL 且 ureq/rustls 导出符号超 ld 65535 上限（家族教训）。
 3. 前端依赖用 `npm ci`；开发：`npm run tauri dev`。
 4. 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（gui 层不进测试二进制，理由见踩坑 3）。
+5. **发布产物必须是 NSIS 安装包**：`npx tauri build --target x86_64-pc-windows-gnu`（需本机已装 NSIS）。裸 exe 缺 `WebView2Loader.dll`，在未装 WebView2 运行时的电脑上启动即失败（v0.2.0 已踩过，勿再发裸 exe）。
 
 ## 模块地图
 
@@ -61,3 +62,5 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 4. **spawn 子进程必须显式重定向 stdio**：proxy start / launch 不置 null 会继承父进程管道，CLI 调用方永不返回（python subprocess 挂起）。
 5. **构建脚本 ASCII-only**：cmd 的 GBK 代码页下 UTF-8 中文注释会被当命令执行。
 6. **本机 PATH 的 `python.exe/python3.exe` 是 Windows Store App Execution Alias**：运行代理自检须显式使用 `%APPDATA%\LobsterAI\runtimes\python-win\python.exe`；Python 候选不能只以文件存在判有效，必须实际启动验证。
+7. **默认工具链是 MSVC 但本机没有可用的 MSVC 链接器**：`C:\Program Files\Git\usr\bin\link.exe` 会抢占 PATH，导致 `serde_core`/`proc-macro2` 等 build script 链接报 `link: extra operand`。必须显式 `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu`（build-release.cmd 已内置），只前置 `D:\mingw64\bin` 不够。
+8. **release 白屏根因**：tauri 的 build.rs 用 `dev = !has_feature("custom-protocol")` 判定模式，缺该 feature 时 release 也不嵌入 `frontendDist`，WebView 改连 `devUrl`（127.0.0.1:5177），vite 未启动即 `chrome-error://chromewebdata/` 白屏。另外 Vite 需 `base: "./"`，否则 `tauri://localhost` 下 `/assets/...` 绝对路径 404。
