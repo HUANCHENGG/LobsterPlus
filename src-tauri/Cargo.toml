@@ -1,6 +1,6 @@
 [package]
 name = "lobster-plus"
-version = "0.2.0"
+version = "0.3.0"
 description = "LobsterAI 多账号切换器"
 license = "MIT"
 edition = "2021"
