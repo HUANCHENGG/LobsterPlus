@@ -129,6 +129,7 @@ const ZH: &[(&str, &str)] = &[
     ("err.proxy.launch", "启动代理失败：{e}"),
     ("err.proxy.start_timeout", "代理启动超时（/health 未就绪）"),
     ("err.proxy.log_tail", "代理日志尾部：\n{log}"),
+    ("err.proxy.log_empty", "（代理无日志输出，进程可能刚启动就退出了。使用的 Python：{py}）"),
     // CC-Switch 注册
     ("err.register.no_db", "未找到 CC-Switch 数据库：{path}（请先安装并运行一次 CC-Switch）"),
     ("err.register.fail", "写入 CC-Switch 失败：{e}"),
@@ -197,6 +198,7 @@ const EN: &[(&str, &str)] = &[
     ("err.proxy.launch", "Failed to launch proxy: {e}"),
     ("err.proxy.start_timeout", "Proxy start timed out (/health not ready)"),
     ("err.proxy.log_tail", "Proxy log tail:\n{log}"),
+    ("err.proxy.log_empty", "(No proxy log output; the process likely exited immediately. Python used: {py})"),
     ("err.register.no_db", "CC-Switch database not found: {path} (install and run CC-Switch once)"),
     ("err.register.fail", "Failed to write CC-Switch: {e}"),
     ("err.register.port_unavailable", "Proxy not running; cannot determine the port (start the proxy first)"),

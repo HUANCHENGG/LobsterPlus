@@ -186,8 +186,11 @@ pub fn launch_lobster(path: &str) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     set_detach_flags(&mut c);
+    // 同 proxy::start：别让长驻的 LobsterAI 继承 CLI 调用方的管道句柄。
+    let _inherit_guard = suspend_std_handle_inheritance();
     c.spawn()
         .map_err(|e| crate::i18n::trf("err.lobster.launch", &[("e", &e.to_string())]))?;
+    drop(_inherit_guard);
     Ok(())
 }
 
@@ -195,6 +198,69 @@ pub fn launch_lobster(path: &str) -> Result<(), String> {
 fn set_detach_flags(c: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     c.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+}
+
+/// RAII：临时清除本进程标准流句柄的 HANDLE_FLAG_INHERIT，drop 时恢复原值。
+///
+/// 为什么需要：Rust std 在 Windows 上以 bInheritHandles=TRUE 创建子进程
+/// （为把重定向后的 stdio 传进去）。于是父进程里所有「可继承」句柄都会漏给
+/// 子进程。CLI 被 shell 用管道调用时（`lobster-plus.exe --cli proxy start |
+/// grep ...`），shell 创建的管道写端就是可继承的；长驻的 Python 代理会把它
+/// 一起继承，导致 lobster-plus.exe 早已退出、grep/cat 却等不到 EOF，
+/// 整条命令永久挂死。
+///
+/// 做法：spawn 前把 CLI 自己的 std 句柄改成不可继承，spawn 完立刻恢复。
+/// 子进程需要的 stdio 是 std 自己复制出的可继承副本，不依赖这里的标志，
+/// 所以不受影响。必须在 spawn **之前**清除——子进程一旦继承，事后无法收回。
+#[cfg(windows)]
+pub struct StdInheritGuard {
+    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+pub fn suspend_std_handle_inheritance() -> StdInheritGuard {
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, SetHandleInformation, HANDLE_FLAG_INHERIT,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let mut saved = Vec::new();
+    for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let h = GetStdHandle(std_id);
+            if h == 0 || h == -1 {
+                continue;
+            }
+            let mut flags: u32 = 0;
+            if GetHandleInformation(h, &mut flags) != 0 && flags & HANDLE_FLAG_INHERIT != 0 {
+                if SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) != 0 {
+                    saved.push((h, flags));
+                }
+            }
+        }
+    }
+    StdInheritGuard { saved }
+}
+
+#[cfg(windows)]
+impl Drop for StdInheritGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        for (h, flags) in self.saved.drain(..) {
+            unsafe {
+                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub struct StdInheritGuard;
+
+#[cfg(not(windows))]
+pub fn suspend_std_handle_inheritance() -> StdInheritGuard {
+    StdInheritGuard
 }
 
 #[cfg(not(windows))]

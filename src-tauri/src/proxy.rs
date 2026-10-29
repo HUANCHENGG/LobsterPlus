@@ -150,9 +150,37 @@ pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
 
 /// 三级 Python 探测：
 /// PATH python.exe → LobsterAI 自带 Python（runtimes\python-win）→ py launcher
+///
+/// 每个候选都必须「实际启动」验证：本机 PATH 里的 python.exe/python3.exe 是
+/// Windows Store App Execution Alias（重定向到 AppInstallerPythonRedirector.exe），
+/// 未从商店装过 Python 时启动即静默退出，退出码 49（ERROR_NOT_FOUND），
+/// 无任何 stdout/stderr。只靠文件存在判断会把 alias 当成可用解释器，
+/// 代理进程瞬间消失，start() 只能报一句「/health 未就绪」的超时，
+/// 而 proxy.log 是空的——问题完全不可诊断。
 pub fn find_python() -> Option<PathBuf> {
-    if let Some(p) = find_in_path("python.exe") {
-        return Some(p);
+    for cand in python_candidates() {
+        if python_works(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// 候选顺序即优先级。同名 python.exe 在不同 PATH 目录下都可能是 alias，
+/// 所以 PATH 里出现的每一个 python.exe 都要单独验证。
+fn python_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(';').filter(|d| !d.is_empty()) {
+            for exe in ["python.exe", "python3.exe"] {
+                push(Path::new(dir).join(exe));
+            }
+        }
     }
     if let Ok(appdata) = std::env::var("APPDATA") {
         let runtime = PathBuf::from(&appdata)
@@ -161,29 +189,29 @@ pub fn find_python() -> Option<PathBuf> {
             .join("python-win");
         // 目录下可能有版本子目录或直接放 python.exe
         if runtime.join("python.exe").is_file() {
-            return Some(runtime.join("python.exe"));
+            push(runtime.join("python.exe"));
         }
         if let Ok(rd) = fs::read_dir(&runtime) {
             for e in rd.flatten() {
-                let cand = e.path().join("python.exe");
-                if cand.is_file() {
-                    return Some(cand);
-                }
+                push(e.path().join("python.exe"));
             }
         }
     }
-    find_in_path("py.exe")
+    // py launcher 不在固定目录，交给 PATH 解析
+    push(PathBuf::from("py.exe"));
+    out
 }
 
-fn find_in_path(exe: &str) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in path_var.split(';').filter(|d| !d.is_empty()) {
-        let cand = Path::new(dir).join(exe);
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
+/// 用 `python -c "pass"` 验证候选真的能跑起来（区分真解释器与 Store alias）。
+fn python_works(py: &Path) -> bool {
+    std::process::Command::new(py)
+        .args(["-c", "pass"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// 启动代理。幂等：/health 已通则直接返回已在运行。
@@ -226,8 +254,14 @@ pub fn start(paths: &Paths) -> Result<ProxyStatus, String> {
     });
     cmd.stdin(std::process::Stdio::null());
     detach(&mut cmd);
+    // 必须在 spawn 前临时清掉 CLI 自身 std 句柄的可继承位：Rust std 在 Windows
+    // 上用 bInheritHandles=TRUE 启子进程，shell 给 CLI 的管道写端会被长驻的
+    // python 一并继承；lobster-plus.exe 退出后 grep/cat 永远等不到 EOF，
+    // `proxy start | grep` 就此挂死。spawn 后 guard drop 自动恢复。
+    let _inherit_guard = crate::guard::suspend_std_handle_inheritance();
     cmd.spawn()
         .map_err(|e| trf("err.proxy.launch", &[("e", &e.to_string())]))?;
+    drop(_inherit_guard);
 
     let deadline = Instant::now() + START_WAIT;
     loop {
@@ -238,7 +272,9 @@ pub fn start(paths: &Paths) -> Result<ProxyStatus, String> {
         if Instant::now() >= deadline {
             let tail = log_tail(paths, 15);
             let extra = if tail.is_empty() {
-                String::new()
+                // 空日志最常见的原因是子进程根本没起来（例如 Windows Store
+                // python alias 静默退出）。带上解释器路径便于排查。
+                trf("err.proxy.log_empty", &[("py", &py.display().to_string())])
             } else {
                 format!("\n{}", trf("err.proxy.log_tail", &[("log", &tail)]))
             };
@@ -389,5 +425,66 @@ mod tests {
     fn script_tag_changes_with_content() {
         assert_eq!(sha2_short(b"abc"), sha2_short(b"abc"));
         assert_ne!(sha2_short(b"abc"), sha2_short(b"abd"));
+    }
+
+    /// 候选列表必须去重且保序：PATH 里同一目录可能出现多次（本机 mingw64/bin
+    /// 就重复了），重复项会让探测白跑一次 `python -c`。
+    #[test]
+    fn candidates_dedup_and_order() {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let mut push = |p: PathBuf| {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        };
+        push(PathBuf::from("a\\python.exe"));
+        push(PathBuf::from("a\\python.exe"));
+        push(PathBuf::from("b\\python.exe"));
+        assert_eq!(
+            out,
+            vec![
+                PathBuf::from("a\\python.exe"),
+                PathBuf::from("b\\python.exe")
+            ]
+        );
+    }
+
+    /// 不存在的路径必须判为不可用（不能当作有效解释器）。
+    #[test]
+    fn python_works_rejects_missing() {
+        assert!(!python_works(Path::new(
+            "Z:\\definitely-not-a-real-python-xyz.exe"
+        )));
+    }
+
+    /// 真解释器要能被 `python -c "pass"` 验证通过。
+    #[test]
+    fn python_works_accepts_real_interpreter() {
+        let Some(py) = find_python() else {
+            // CI/无 Python 环境：跳过而非失败
+            return;
+        };
+        assert!(python_works(&py), "{} 实际不可用", py.display());
+    }
+
+    /// 回归：PATH 首位是 Windows Store alias（启动即退出码 49）时，
+    /// find_python 必须跳过它找到真正的解释器，而不是把 alias 交出去。
+    #[test]
+    fn find_python_skips_store_alias() {
+        let alias = PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+            .join("Local")
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("python.exe");
+        if !alias.is_file() {
+            return;
+        }
+        // alias 存在但不可用；若 find_python 返回它，说明校验失效
+        if let Some(py) = find_python() {
+            assert_ne!(
+                py, alias,
+                "find_python 返回了 Windows Store alias（未做实际启动校验）"
+            );
+        }
     }
 }
