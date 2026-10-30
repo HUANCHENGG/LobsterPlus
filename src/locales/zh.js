@@ -2,6 +2,9 @@ export const zh = {
   // 标题与状态
   appTitle: "LobsterPlus",
   appSub: "LobsterAI 多账号切换器",
+  versionTip: "LobsterPlus v{v}",
+  versionProxyStale: "代理仍在运行旧脚本（{running}，应为 {expected}）。重启代理后新代码才会生效。",
+  versionProxyStaleShort: "代理待重启",
   chipLobsterOn: "LobsterAI 运行中",
   chipLobsterOff: "LobsterAI 未运行",
   chipLoggedIn: "已登录",
@@ -23,6 +26,7 @@ export const zh = {
   proxyDesc: "固定端口转发 LobsterAI 本地模型服务（端口/key 随重启轮换的痛点被彻底屏蔽）。",
   proxyOpenaiUrl: "OpenAI",
   proxyAnthropicUrl: "Anthropic",
+  proxyModels: "可用模型",
   proxyUpstream: "上游",
   proxyStart: "启动代理",
   proxyStop: "停止代理",

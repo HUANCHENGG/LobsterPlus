@@ -45,6 +45,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 USAGE_DB_PATH = os.path.join(HERE, "usage.sqlite")
 USAGE_SCHEMA_VERSION = 2
+# 代理脚本版本：Rust 侧启动时用它判断磁盘上的脚本是否比正在运行的进程新。
+# 升级安装后旧进程仍在跑，必须能识别出来并重启，否则改再多次也不生效
+# （v0.3.3 实测：另一台机器升级后 CC-Switch 拿到的仍是旧的 5 个模型）。
+PROXY_SCRIPT_VERSION = "0.3.4"
 
 # 客户端在响应写完之前主动断开连接时会抛出的异常。
 # 注意三者是「兄弟」而非父子关系：ConnectionAbortedError 既不是
@@ -547,11 +551,18 @@ class UpstreamManager(object):
                 with self._server_lock:
                     self._server_catalog = entries
                     self._server_at = time.time()
-                # 换个锁再清模型缓存：_lock 与 _server_lock 不可嵌套
-                # （_catalog_entries 持 _probe_lock 时会拿 _server_lock，
-                # 反序会死锁）。
+                # 立即用新目录重建模型缓存，而不是只置 None 等懒加载：
+                # /health 走 peek() 只读缓存，置 None 会让它在下次
+                # /v1/models 之前一直返回空/仅 config 的残缺清单。
+                base = None
                 with self._lock:
-                    self._models_cache = None
+                    if self._cached:
+                        base = self._cached[0]
+                if base:
+                    rebuilt = self._catalog_model_list(base)
+                    with self._lock:
+                        self._models_cache = rebuilt
+                        self._models_at = time.time()
                 log("服务端模型目录: %d 个模型" % len(entries))
         except Exception as e:
             log("警告: 服务端模型目录刷新失败 (%s)" % e)
@@ -600,6 +611,15 @@ class UpstreamManager(object):
         with self._server_lock:
             return self._server_catalog
 
+    def _catalog_model_list(self, base_url):
+        """由当前目录拼 OpenAI 格式清单（不访问上游端点，纯本地）。"""
+        entries = self._catalog_entries(base_url)
+        if not entries:
+            return None
+        return {"object": "list",
+                "data": [{"id": e["id"], "type": "model",
+                          "display_name": e["display_name"]} for e in entries]}
+
     def _fetch_models(self, base, key):
         """上游模型清单（无锁版本，调用方须在 _probe_lock 内）。
 
@@ -619,11 +639,9 @@ class UpstreamManager(object):
             upstream = None
         if isinstance(upstream, dict) and (upstream.get("data") or upstream.get("models")):
             return upstream
-        entries = self._catalog_entries(base)
-        if entries:
-            return {"object": "list",
-                    "data": [{"id": e["id"], "type": "model",
-                              "display_name": e["display_name"]} for e in entries]}
+        local = self._catalog_model_list(base)
+        if local:
+            return local
         if isinstance(upstream, dict):
             return upstream
         return None
@@ -1418,6 +1436,8 @@ class Handler(BaseHTTPRequestHandler):
                 "upstream_alive": bool(base),
                 "default_model": CONFIG["default_model"],
                 "models": _models_from_cache(models_cache),
+                # Rust 侧靠它判断正在运行的进程是否还是旧脚本（升级后自动重启）
+                "script_version": PROXY_SCRIPT_VERSION,
             })
             return
         if path in ("/models",):

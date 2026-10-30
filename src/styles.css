@@ -47,6 +47,15 @@ body {
 .h-logo { width: 22px; height: 22px; border-radius: 6px; }
 .h-title { font-size: 17px; font-weight: 600; }
 .h-sub { color: var(--muted); font-size: 12px; margin-left: 2px; }
+/* 版本号：mono 小字；代理仍在跑旧脚本时变黄提醒重启 */
+.h-version {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 999px; padding: 2px 8px; margin-right: 4px;
+  cursor: default; white-space: nowrap;
+}
+.h-version.stale { color: var(--warn); border-color: var(--warn); }
 .h-spacer { flex: 1; }
 .icon-btn {
   background: transparent; border: 1px solid var(--line); color: var(--muted);

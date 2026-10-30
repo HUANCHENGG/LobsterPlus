@@ -12,6 +12,33 @@ let todayUsage = null;
 let usageModal = null;
 let usageRefreshTimer = null;
 let usageRequestSeq = 0;
+let appVersion = null;
+
+async function loadAppVersion() {
+  if (appVersion) return appVersion;
+  try {
+    appVersion = await invoke("app_version");
+  } catch (_) {
+    appVersion = null;
+  }
+  return appVersion;
+}
+
+// 版本标签：v0.3.4；代理仍在跑旧脚本时额外标出（升级后代理没重启）
+function versionLabel() {
+  const v = appVersion?.version;
+  if (!v) return "";
+  const p = state?.proxy || {};
+  const stale = p.running && p.stale;
+  const tip = stale
+    ? t("versionProxyStale", {
+        running: p.script_version || "?",
+        expected: p.expected_version || v,
+      })
+    : t("versionTip", { v });
+  const short = stale ? ` · ${t("versionProxyStaleShort")}` : "";
+  return `<span class="h-version${stale ? " stale" : ""}" title="${esc(tip)}">v${esc(v)}${short}</span>`;
+}
 
 async function guard(fn) {
   if (busy) return;
@@ -32,6 +59,7 @@ function stripErr(e) {
 }
 
 async function refresh() {
+  await loadAppVersion();
   state = await invoke("get_state");
   if (state?.language) init(state.language);
   render();
@@ -142,6 +170,7 @@ function proxyCard() {
       <span class="proxy-url"><b>${t("proxyOpenaiUrl")}</b><code>http://127.0.0.1:${port}/v1/chat/completions</code></span>
       <span class="proxy-url"><b>${t("proxyAnthropicUrl")}</b><code>http://127.0.0.1:${port}/v1/messages</code></span>
       <span class="proxy-url"><b>${t("proxyUpstream")}</b><code>${upstream}</code> ${running ? (upstreamOk ? `<span class="chip on"><span class="dot"></span>${t("chipUpstreamOk")}</span>` : `<span class="chip warn"><span class="dot"></span>${t("chipUpstreamDown")}</span>`) : ""}</span>
+      ${running && p.model_count != null ? `<span class="proxy-url"><b>${t("proxyModels")}</b><code>${p.model_count}</code>${p.stale ? `<span class="chip warn"><span class="dot"></span>${t("versionProxyStaleShort")}</span>` : ""}</span>` : ""}
     </div>
     <div class="proxy-usage-row">
       <span class="proxy-usage-label">${esc(t("usageToday"))}</span>
@@ -217,6 +246,7 @@ function render() {
       <span class="h-title">${t("appTitle")}</span>
       <span class="h-sub">${t("appSub")}</span>
       <span class="h-spacer"></span>
+      ${versionLabel()}
       <button class="icon-btn" data-act="lang" title="Language">${ic("globe", 15)}</button>
       <button class="icon-btn" data-act="settings" title="${t("setTitle")}">${ic("gear", 15)}</button>
     </div>

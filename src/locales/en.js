@@ -2,6 +2,9 @@ export const en = {
   // Title & status
   appTitle: "LobsterPlus",
   appSub: "LobsterAI multi-account switcher",
+  versionTip: "LobsterPlus v{v}",
+  versionProxyStale: "The proxy is still running the old script ({running}, expected {expected}). Restart the proxy to apply the new code.",
+  versionProxyStaleShort: "proxy restart needed",
   chipLobsterOn: "LobsterAI running",
   chipLobsterOff: "LobsterAI not running",
   chipLoggedIn: "Logged in",
@@ -23,6 +26,7 @@ export const en = {
   proxyDesc: "Forwards the LobsterAI local model service on a fixed port (the rotating port/key pain point is fully hidden).",
   proxyOpenaiUrl: "OpenAI",
   proxyAnthropicUrl: "Anthropic",
+  proxyModels: "Models",
   proxyUpstream: "Upstream",
   proxyStart: "Start proxy",
   proxyStop: "Stop proxy",

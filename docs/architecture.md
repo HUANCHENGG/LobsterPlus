@@ -126,7 +126,9 @@ token 策略：
 
 **`claude-*` 映射别名绝不进模型清单**：它们是协议转换用的虚拟名（`claude-opus-4-8` → `glm-5.3`），请求侧仍然有效，但列进 `/v1/models` 会让 CC-Switch 的模型选择器出现不可用项——这正是「只拿到 5 个模型且模型名疑似不是可提供的模型」的根因（服务端与本地目录都拿不到时，只剩 5 个 config 映射）。`list_models` / `_models_from_cache` 统一走 `_config_real_models()` 过滤。
 
-服务端目录有独立缓存（600s）与独立锁 `_server_lock`：它会走 HTTPS（最坏 6s），**绝不能持 `_lock` 拉取**——`peek()` 也要 `_lock`，持锁会让 `/health` 超时（踩坑 10 同类）。`probe()` 的网络动作在 `_probe_lock` 内，`_lock` 只保护字段。`model_catalog_selftest()` 覆盖两处合并/展示名/服务端优先/别名过滤。
+服务端目录有独立缓存（600s）与独立锁 `_server_lock`：它会走 HTTPS（最坏 6s），**绝不能持 `_lock` 拉取**——`peek()` 也要 `_lock`，持锁会让 `/health` 超时（踩坑 10 同类）。`probe()` 的网络动作在 `_probe_lock` 内，`_lock` 只保护字段。刷新成功后**立即用新目录重建 `_models_cache`**（而不是只置 `None` 等懒加载）——`/health` 走 `peek()` 只读缓存，置空会让它在下次 `/v1/models` 之前返回残缺清单（启动瞬间实测 `model_count` 只有 2）。`model_catalog_selftest()` 覆盖两处合并/展示名/服务端优先/别名过滤。
+
+**代理脚本热更新（升级必须重启旧进程）**：`lobster_proxy.py` 内嵌 `PROXY_SCRIPT_VERSION`，`/health` 返回 `script_version`；Rust 侧 `ProxyStatus` 带 `script_version` / `expected_version` / `stale` / `model_count`。`proxy::start()` 若发现 `/health` 通但 `stale`（版本不一致，或老脚本不返回该字段），会先 `stop()` 再启动——**否则升级安装后旧 Python 进程继续跑旧代码，所有修复都不生效**（v0.3.3 实测：另一台机器装完新版，CC-Switch 获取模型仍是 5 个）。`embedded_script_version_matches_crate_version` 断言两侧版本常量一致。GUI 标题栏显示 `v0.3.4`，代理 stale 时变黄并提示重启，代理卡片显示可用模型数。
 
 **Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），schema `user_version=2`，`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`，并可迁移旧 `daily_usage` 表。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上游响应 usage 同时给出输入/输出 token，缺任一字段时整次请求按本地规则记为 `estimated`；`missing` 是迁移未知旧来源或显式缺失记录的保留口径，正常采集主要使用前两类。
 

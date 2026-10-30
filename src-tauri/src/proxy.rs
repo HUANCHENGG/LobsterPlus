@@ -21,7 +21,7 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 /// 释放目录里脚本的版本标记：编译期内嵌脚本变化（sha256 前 8 位）时自动覆盖更新。
 const SCRIPT_TAG: &str = "released-by-lobsterplus";
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct ProxyStatus {
     pub running: bool,
     pub port: u16,
@@ -30,7 +30,23 @@ pub struct ProxyStatus {
     /// 上游（LobsterAI 本地模型代理）当前是否探测成功
     pub upstream_alive: Option<bool>,
     pub upstream: Option<String>,
+    /// 正在运行的代理进程报告的脚本版本（/health 的 script_version）
+    pub script_version: Option<String>,
+    /// 本程序内嵌的脚本版本（应为 CARGO_PKG_VERSION）
+    pub expected_version: Option<String>,
+    /// 运行中的是旧脚本：需要重启代理才能生效
+    pub stale: bool,
+    /// 代理当前能提供的模型数（/health 的 models 长度），用于自检清单是否完整
+    pub model_count: Option<usize>,
 }
+
+/// 代理脚本版本（与 lobster_proxy.py 的 PROXY_SCRIPT_VERSION 保持一致）。
+///
+/// 升级安装后旧的 Python 进程仍在跑旧脚本，`start()` 原先看到 /health
+/// 通就直接返回，**从不重启**——用户升级了也拿不到新行为。v0.3.3 实测：
+/// 另一台机器装完新版，CC-Switch 获取模型仍是旧的 5 个。现在靠版本比对
+/// 触发自动重启。
+pub const SCRIPT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 释放内嵌脚本与默认配置。脚本带版本标记随程序更新；config.json 只在缺失时写。
 pub fn ensure_released(paths: &Paths) -> Result<PathBuf, String> {
@@ -106,11 +122,8 @@ pub fn api_key(paths: &Paths) -> Option<String> {
 pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
     if in_sandbox() {
         return Ok(ProxyStatus {
-            running: false,
             port: DEFAULT_PORT,
-            foreign: false,
-            upstream_alive: None,
-            upstream: None,
+            ..Default::default()
         });
     }
     let port = listen_port(paths);
@@ -118,11 +131,8 @@ pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
     let resp = ureq::get(&url).timeout(HEALTH_TIMEOUT).call();
     let Some(resp) = resp.ok() else {
         return Ok(ProxyStatus {
-            running: false,
             port,
-            foreign: false,
-            upstream_alive: None,
-            upstream: None,
+            ..Default::default()
         });
     };
     let body = resp.into_string().unwrap_or_default();
@@ -130,20 +140,33 @@ pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
         Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("ok") => {
             let upstream_alive = v.get("upstream_alive").and_then(|x| x.as_bool());
             let upstream = v.get("upstream").and_then(|x| x.as_str()).map(String::from);
+            let script_version = v
+                .get("script_version")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            // 老脚本不返回 script_version，也视为 stale（必须重启换新脚本）
+            let stale = script_version.as_deref() != Some(SCRIPT_VERSION);
+            let model_count = v
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| a.len());
             Ok(ProxyStatus {
                 running: true,
                 port,
                 foreign: false,
                 upstream_alive,
                 upstream,
+                script_version,
+                expected_version: Some(SCRIPT_VERSION.to_string()),
+                stale,
+                model_count,
             })
         }
         _ => Ok(ProxyStatus {
             running: false,
             port,
             foreign: true,
-            upstream_alive: None,
-            upstream: None,
+            ..Default::default()
         }),
     }
 }
@@ -214,16 +237,24 @@ fn python_works(py: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 启动代理。幂等：/health 已通则直接返回已在运行。
+/// 启动代理。幂等：/health 已通且脚本版本一致则直接返回已在运行；
+/// 若运行中的是旧脚本（升级安装后旧 Python 进程未退出），先停再起。
 pub fn start(paths: &Paths) -> Result<ProxyStatus, String> {
     if in_sandbox() {
         return Err(tr("err.proxy.sandbox"));
     }
     let st = health(paths)?;
-    if st.running {
+    if st.running && !st.stale {
         return Ok(st);
     }
+    let stale_running = st.running && st.stale;
+    // 先释放内嵌脚本：即使后面不重启，磁盘上的脚本也要是最新的
     let dir = ensure_released(paths)?;
+    if stale_running {
+        // 旧进程持有旧代码；不重启的话所有修复都不生效
+        stop(paths)?;
+        std::thread::sleep(Duration::from_millis(300));
+    }
     let script = dir.join("lobster_proxy.py");
     let Some(py) = find_python() else {
         return Err(tr("err.proxy.no_python"));
@@ -425,6 +456,17 @@ mod tests {
     fn script_tag_changes_with_content() {
         assert_eq!(sha2_short(b"abc"), sha2_short(b"abc"));
         assert_ne!(sha2_short(b"abc"), sha2_short(b"abd"));
+    }
+
+    /// 回归：内嵌脚本的 PROXY_SCRIPT_VERSION 必须与 CARGO_PKG_VERSION 一致，
+    /// 否则升级后 stale 判断永远为真，每次 start 都会多一次无谓重启。
+    #[test]
+    fn embedded_script_version_matches_crate_version() {
+        let needle = format!("PROXY_SCRIPT_VERSION = \"{}\"", SCRIPT_VERSION);
+        assert!(
+            PROXY_SCRIPT.contains(&needle),
+            "lobster_proxy.py 的 PROXY_SCRIPT_VERSION 必须等于 {SCRIPT_VERSION}"
+        );
     }
 
     /// 候选列表必须去重且保序：PATH 里同一目录可能出现多次（本机 mingw64/bin

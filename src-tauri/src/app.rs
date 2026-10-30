@@ -119,6 +119,15 @@ fn proxy_status() -> Result<Value, String> {
     proxy::health(&paths).map(|st| serde_json::to_value(st).unwrap_or(Value::Null))
 }
 
+/// 应用版本信息（界面标题栏显示）。
+#[tauri::command]
+fn app_version() -> Value {
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "script_version": proxy::SCRIPT_VERSION,
+    })
+}
+
 #[tauri::command]
 fn proxy_start() -> Result<Value, String> {
     let paths = Paths::detect();
@@ -224,6 +233,7 @@ pub fn run() {
             proxy_stop,
             proxy_log,
             proxy_usage,
+            app_version,
             register_ccswitch,
             set_settings,
         ])
