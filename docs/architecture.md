@@ -128,7 +128,7 @@ token 策略：
 
 服务端目录有独立缓存（600s）与独立锁 `_server_lock`：它会走 HTTPS（最坏 6s），**绝不能持 `_lock` 拉取**——`peek()` 也要 `_lock`，持锁会让 `/health` 超时（踩坑 10 同类）。`probe()` 的网络动作在 `_probe_lock` 内，`_lock` 只保护字段。刷新成功后**立即用新目录重建 `_models_cache`**（而不是只置 `None` 等懒加载）——`/health` 走 `peek()` 只读缓存，置空会让它在下次 `/v1/models` 之前返回残缺清单（启动瞬间实测 `model_count` 只有 2）。`model_catalog_selftest()` 覆盖两处合并/展示名/服务端优先/别名过滤。
 
-**代理脚本热更新（升级必须重启旧进程）**：`lobster_proxy.py` 内嵌 `PROXY_SCRIPT_VERSION`，`/health` 返回 `script_version`；Rust 侧 `ProxyStatus` 带 `script_version` / `expected_version` / `stale` / `model_count`。`proxy::start()` 若发现 `/health` 通但 `stale`（版本不一致，或老脚本不返回该字段），会先 `stop()` 再启动——**否则升级安装后旧 Python 进程继续跑旧代码，所有修复都不生效**（v0.3.3 实测：另一台机器装完新版，CC-Switch 获取模型仍是 5 个）。`embedded_script_version_matches_crate_version` 断言两侧版本常量一致。GUI 标题栏显示 `v0.3.4`，代理 stale 时变黄并提示重启，代理卡片显示可用模型数。
+**代理脚本热更新（升级必须重启旧进程）**：`lobster_proxy.py` 内嵌 `PROXY_SCRIPT_VERSION`，`/health` 返回 `script_version`；Rust 侧 `ProxyStatus` 带 `script_version` / `expected_version` / `stale` / `model_count`。`proxy::start()` 若发现 `/health` 通但 `stale`（版本不一致，或老脚本不返回该字段），会先 `stop()` 再启动——**否则升级安装后旧 Python 进程继续跑旧代码，所有修复都不生效**（v0.3.3 实测：另一台机器装完新版，CC-Switch 获取模型仍是 5 个）。`embedded_script_version_matches_crate_version` 断言两侧版本常量一致。GUI 标题栏显示当前版本号（`app_version` 命令读 `CARGO_PKG_VERSION`），代理 stale 时胶囊变黄并提示重启，代理卡片显示可用模型数。
 
 **Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），schema `user_version=2`，`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`，并可迁移旧 `daily_usage` 表。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上游响应 usage 同时给出输入/输出 token，缺任一字段时整次请求按本地规则记为 `estimated`；`missing` 是迁移未知旧来源或显式缺失记录的保留口径，正常采集主要使用前两类。
 
@@ -139,10 +139,10 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 | 路由 | 协议 | 处理 |
 |---|---|---|
 | POST /v1/chat/completions | OpenAI | 纯透传（模型名归一化） |
-| GET /v1/models | OpenAI | 上游清单 + config 映射合并 |
+| GET /v1/models | OpenAI | 服务端权威目录 + 本地 openclaw 配置 + config 真实 ID（`claude-*` 别名不出现） |
 | POST /v1/messages | Anthropic | → OpenAI 转换（fork raccoon 转换层：system/messages/tools/tool_result 互转 + SSE 事件发射器 + thinking） |
 | POST /v1/messages/count_tokens | Anthropic | 估算 |
-| GET /health | — | 状态 + 上游探测结果（**只读内存缓存**，绝不发起网络探测；缓存由启动探测与后台刷新线程维护，保证 GUI 1.5s 超时内返回） |
+| GET /health | — | 状态 + 上游探测结果 + `script_version` + models 名列表（**只读内存缓存**，绝不发起网络探测；缓存由启动探测与后台刷新线程维护，保证 GUI 1.5s 超时内返回） |
 
 模型映射：上游存在的 ID 直通；`claude-*` 前缀按 config models 映射（默认 opus→glm-5.3、sonnet/haiku→deepseek-flash）；兜底 default_model。
 
@@ -163,9 +163,9 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 - `custom-protocol` 是 release 必需项：tauri build.rs 以 `dev = !has_feature("custom-protocol")` 判定模式，缺它则不嵌入 `frontendDist`，WebView 改连 `devUrl`（127.0.0.1:5177），vite 未启动即 `chrome-error://chromewebdata/` 白屏；Vite 另需 `base: "./"`。
 - `[lib]` 只留 `rlib`（cdylib 超 MinGW ld 65535 符号上限）。
 - 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（含 Rust usage 只读查询；gui 层不进测试二进制）。
-- Python 用量存储自检（不访问真实上游）：`"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage`（schema/v1 迁移/WAL/聚合/失败/并发写入；本机 PATH 的 `python` 是 Windows Store alias，不可用）。
+- Python 自检三合一（不访问真实上游）：`"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage`（`usage_storage_selftest` schema/v1 迁移/WAL/聚合/失败/并发；`resilience_selftest` 10053 捕获/健康检查零阻塞/别名过滤；`model_catalog_selftest` 两处合并/展示名/服务端优先。本机 PATH 的 `python` 是 Windows Store alias，不可用）。
 - 发布：`npx tauri build --target x86_64-pc-windows-gnu`（需 NSIS）→ `bundle\nsis\LobsterPlus_<版本>_x64-setup.exe`。**只能发安装包**：exe 依赖同目录 `WebView2Loader.dll`，裸发会在未装 WebView2 运行时的机器上启动失败（v0.2.0 教训）。
-- 版本号需同步四处：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`。
+- 版本号需同步五处：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/proxy/lobster_proxy.py` 的 `PROXY_SCRIPT_VERSION`。最后一项必须等于 `CARGO_PKG_VERSION`，否则 `proxy::start()` 每次都误判 stale 并多一次无谓重启——`proxy::tests::embedded_script_version_matches_crate_version` 会在不一致时让单测失败。
 
 ## 六、E2E 验收清单
 

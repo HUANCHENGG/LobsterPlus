@@ -10,6 +10,7 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 3. 前端依赖用 `npm ci`；开发：`npm run tauri dev`。
 4. 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（gui 层不进测试二进制，理由见踩坑 3）。
 5. **发布产物必须是 NSIS 安装包**：`npx tauri build --target x86_64-pc-windows-gnu`（需本机已装 NSIS）。裸 exe 缺 `WebView2Loader.dll`，在未装 WebView2 运行时的电脑上启动即失败（v0.2.0 已踩过，勿再发裸 exe）。
+6. **升版本要改五处**：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/proxy/lobster_proxy.py` 的 `PROXY_SCRIPT_VERSION`。最后一项必须等于 `CARGO_PKG_VERSION`，否则 `proxy::start()` 每次都误判 stale 多一次重启；`proxy::tests::embedded_script_version_matches_crate_version` 会在不一致时失败。
 
 ## 模块地图
 
@@ -20,7 +21,7 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 | `kvdb.rs` | lobsterai.sqlite kv 读写与在线备份 | SQLite Backup API 包含活跃 WAL；live 写仅限客户端退出后的续期回写 |
 | `checkin.rs` | 签到三步 HTTP + token 续期 | 51102=登录失效；51104=已签（幂等）；1h 节流 |
 | `guard.rs` | LobsterAI.exe 进程管理 | 优雅关闭=taskkill 不带 /F（WAL 落盘）；Electron 多进程全退才继续 |
-| `proxy.rs` | Python 代理生命周期 | include_str! 内嵌脚本；.released-tag 版本标记自动更新；config.json 只在缺失时写 |
+| `proxy.rs` | Python 代理生命周期 | include_str! 内嵌脚本；`.released-tag` 内容哈希 + `/health` 的 `script_version` 双重比对，脚本变旧自动重启；config.json 只在缺失时写 |
 | `usage.rs` | Token usage 只读查询 | 校验 usage_daily 列契约；today/7d/30d/all；按日/模型聚合 |
 | `register.rs` | CC-Switch 注册 | 写前备份 db、写后还原激活项；apiFormat=anthropic |
 | `zcrypto.rs` | enc:v1 AES-256-GCM | AAD=`lobster-plus:v1`（注意与家族前作不同） |
@@ -43,7 +44,7 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 4. CLI 新子命令：i18n.rs 补 usage 文案（zh/en 两份）；JSON 输出不得含 token/apiKey。
 5. `lobster_proxy.py` 是纯标准库脚本（Python 3.8+），禁止引第三方依赖；存储/schema 改动跑 `--selftest-storage`，协议或真实上游改动再跑 `--selftest`。
 6. `usage_daily` 是 Python 写、Rust 读的跨语言契约；修改表名、列名、列顺序或统计口径时，必须同步代理 migration/selftest、`usage.rs` 的 `USAGE_COLUMNS`/测试、前端 DTO 使用和架构文档。统计失败不得阻断转发，不得保存请求/响应正文或密钥。
-7. 前端无框架（原生 ESM），文案进 `src/locales/{zh,en}.js`，图标进 `src/icons.js`。
+7. 前端无框架（原生 ESM），文案进 `src/locales/{zh,en}.js`，图标进 `src/icons.js`。版本号显示在标题栏（`app_version` 命令），代理 stale 时变黄；新增界面可见的全局状态优先加到 `get_state` 的 `proxy` 字段（`ProxyStatus` 直接序列化过去），不要单开命令。
 
 ## 已知上游事实（逆向结论，勿凭印象改）
 
@@ -66,6 +67,8 @@ LobsterPlus：有道 LobsterAI 多账号切换器（Tauri 2 + Rust + 原生 JS �
 8. **release 白屏根因**：tauri 的 build.rs 用 `dev = !has_feature("custom-protocol")` 判定模式，缺该 feature 时 release 也不嵌入 `frontendDist`，WebView 改连 `devUrl`（127.0.0.1:5177），vite 未启动即 `chrome-error://chromewebdata/` 白屏。另外 Vite 需 `base: "./"`，否则 `tauri://localhost` 下 `/assets/...` 绝对路径 404。
 9. **`ConnectionAbortedError` 不是 `BrokenPipeError`/`ConnectionResetError` 的子类**（三者是兄弟，共同父类才是 `ConnectionError`）。Windows 上客户端超时/取消时抛的是 `ConnectionAbortedError [WinError 10053]`，只 `except (BrokenPipeError, ConnectionResetError)` 会漏掉它，`socketserver` 于是打印整段 traceback 到 `proxy.log`——用户看到就以为代理坏了，实际对端先挂而已。代理脚本统一用 `CLIENT_GONE_ERRORS` 常量，并覆写 `Handler.handle_one_request` / `handle_error` 兜底。回归用例在 `resilience_selftest()`（随 `--selftest-storage` 一起跑，不联网）。
 10. **`/health` 绝不能同步探上游**：GUI 用 1.5s 超时轮询它。原实现每次 `UPSTREAM.probe()`，上游不在时要做 TCP 探活（1.5s×候选数）+ 最小 chat 请求（4s），最坏 10s+ → GUI 超时并主动断连，反过来产生 WinError 10053 刷屏，形成"日志报错→以为代理异常"的假象。现在 `/health` 只读 `UPSTREAM.peek()`（纯内存快照，70-90ms），缓存由启动探测 + `start_probe_refresher()` 后台线程（默认 60s）维护。新增上游探测类功能时**不要**在请求路径上调用 `probe()`。
-11. **模型清单的权威来源是 LobsterAI 服务端 `/api/models/available`，其次本地 openclaw 配置，`claude-*` 别名绝不进清单**：上游 `/v1/models` 实测 404（连 `/model/list`、`/v1/models` 等变体都 404）。客户端自己就从服务端拉（asar `[Auth:getModels]`），返回 `{code:0,data:[{modelId,modelName,contextWindow,accessible,...}]}`；鉴权用 live `lobsterai.sqlite` 的 `kv.auth_tokens.accessToken`，**必须 `mode=ro` 只读打开**（客户端运行时 live 库有活跃 WAL）。退化路径：`_collect_model_catalogs` 合并 `agents/main/agent/models.json` 与 `openclaw.json` 的 `providers[*].models`（不要求 apiKey）→ `config.json` 里 `name == id` 的真实项。**`claude-*` 映射别名是协议转换虚拟名，只能用于请求侧 `resolve_model`，绝不能出现在 `/v1/models` 或 `/health` 的 models 里**（另一台机器两处目录都为空时只剩 5 个映射，用户看到的就是「模型名不是可提供的模型」）。服务端目录走 HTTPS 最坏 6s，必须在 `_server_lock`/锁外拉取——持 `_lock` 会让 `peek()` 和 `/health` 一起超时（踩坑 10 同类）。`model_catalog_selftest()` 是回归（随 `--selftest-storage` 跑，模型目录部分不联网）。
+11. **模型清单的权威来源是 LobsterAI 服务端 `/api/models/available`，其次本地 openclaw 配置，`claude-*` 别名绝不进清单**：上游 `/v1/models` 实测 404（`/model/list` 等变体同样 404）。客户端自己就从服务端拉（asar `[Auth:getModels]`），返回 `{code:0,data:[{modelId,modelName,contextWindow,accessible,...}]}`；鉴权用 live `lobsterai.sqlite` 的 `kv.auth_tokens.accessToken`，**必须 `mode=ro` 只读打开**（客户端运行时 live 库有活跃 WAL）。退化路径：`_collect_model_catalogs` 合并 `agents/main/agent/models.json` 与 `openclaw.json` 的 `providers[*].models`（不要求 apiKey）→ `config.json` 里 `name == id` 的真实项。**`claude-*` 别名是协议转换虚拟名，只能用于请求侧 `resolve_model`，绝不能出现在 `/v1/models` 或 `/health` 的 models 里**（两处目录都为空时只剩 5 个映射，用户看到的就是「模型名不是可提供的模型」）。服务端目录走 HTTPS 最坏 6s，必须在 `_server_lock`/锁外拉取——持 `_lock` 会让 `peek()` 和 `/health` 一起超时（同类于踩坑 10）。`model_catalog_selftest()` 是回归（随 `--selftest-storage` 跑，不联网）。
 12. **CC-Switch provider 的 meta 不能写 `isFullUrl: true`**：该开关会让 CC-Switch 把 base_url 当完整端点用（不再拼路径），且模型获取走「从完整 URL 推导 models 端点」分支——对 `http://127.0.0.1:19260` 这种裸 host 直接报 `Cannot derive models endpoint from full URL`。LobsterPlus 代理本身就说 Anthropic 协议，`apiFormat: anthropic` + base_url 到端口即可；`register::tests::meta_keeps_direct_url_semantics` 防回归。CC-Switch 4.0.4 的取模型逻辑见 `src-tauri/src/services/model_fetch.rs`（`build_models_url_candidates`）。
-13. **升级安装后必须重启旧代理进程，否则所有修复都不生效**：`lobster_proxy.py` 是运行时释放到 `~/.lobster-plus/proxy/` 并被长驻 Python 进程执行的；旧版 `start()` 看到 `/health` 通就直接返回，**从不重启**。v0.3.3 实测：另一台机器装了新版，CC-Switch 收获模型仍是旧的 5 个——因为跑的是几小时前启动的旧脚本。现在脚本内嵌 `PROXY_SCRIPT_VERSION`、`/health` 返回 `script_version`，`ProxyStatus` 带 `stale`；`start()` 在 `stale` 时先 `stop()` 再起。`embedded_script_version_matches_crate_version` 断言 `lobster_proxy.py` 的常量和 `CARGO_PKG_VERSION` 一致（两边都得改）。另注意：服务端目录刷新后必须**立即重建 `_models_cache`**，只置 `None` 会让 `/health` 的 `peek()` 返回残缺清单（启动瞬间实测只有 2 个）。
+13. **升级安装后必须重启旧代理进程，否则所有修复都不生效**：`lobster_proxy.py` 运行时释放到 `~/.lobster-plus/proxy/`，由长驻 Python 进程执行；只查 `/health` 通就 `return` 的实现会让旧进程一直跑旧代码。现在脚本内嵌 `PROXY_SCRIPT_VERSION`、`/health` 返回 `script_version`，`ProxyStatus` 带 `stale`，`start()` 在 stale 时先 `stop()` 再起。另外：服务端目录刷新后必须**立即重建 `_models_cache`**，只置 `None` 会让 `/health` 的 `peek()` 返回残缺清单（启动瞬间只有 2 个）。
+
+<!-- neat-freak: initialized at 2026-10-30 -->
