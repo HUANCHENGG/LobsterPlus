@@ -341,6 +341,70 @@ def _collect_model_catalogs(data_dir):
     return out
 
 
+def _server_model_catalog(data_dir, timeout=6):
+    """从 LobsterAI 服务端 `GET /api/models/available` 拉权威模型目录。
+
+    实测这是客户端自己用的唯一权威来源（app.asar 的
+    `[Auth:getModels] requesting available models at ...`）：返回
+    `{"code":0,"data":[{modelId, modelName, contextWindow, accessible, ...}]}`。
+    本地 openclaw 配置只是它的投影，可能缺失或过期（另一台机器实测为空，
+    代理只能退回 config.json 的映射名）。
+
+    鉴权用 live `lobsterai.sqlite` 的 kv.auth_tokens.accessToken。只读打开
+    （`mode=ro`），绝不在客户端运行时写 live 库——数据库有活跃 WAL，
+    并发写会损坏数据。
+
+    失败一律返回 None（离线/未登录/接口变更都不影响代理转发）。
+    """
+    try:
+        import sqlite3
+        db = os.path.join(data_dir, "lobsterai.sqlite")
+        if not os.path.isfile(db):
+            return None
+        uri = "file:" + urllib.request.pathname2url(db) + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=3)
+        try:
+            row = conn.execute(
+                "SELECT value FROM kv WHERE key='auth_tokens'").fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        token = (json.loads(row[0]) or {}).get("accessToken")
+        if not token:
+            return None
+        # testMode 用 inner 域名；可用 config.json 的 server_base_url 覆盖
+        base = str(CONFIG.get("server_base_url") or "").strip()
+        if not base:
+            base = "https://lobsterai-server.youdao.com"
+        req = urllib.request.Request(
+            base + "/api/models/available",
+            headers={"Authorization": "Bearer " + token,
+                     "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        if not isinstance(body, dict) or body.get("code") != 0:
+            return None
+        entries = []
+        for m in body.get("data") or []:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("modelId") or "").strip()
+            if not mid:
+                continue
+            entries.append({
+                "id": mid,
+                "display_name": str(m.get("modelName") or mid),
+                "context_window": m.get("contextWindow"),
+                "accessible": m.get("accessible"),
+                "restriction": m.get("restrictionHint"),
+            })
+        return entries or None
+    except Exception as e:
+        log("警告: 服务端模型目录获取失败 (%s)" % e)
+        return None
+
+
 def _collect_candidates(data_dir):
     """从 models.json 与 openclaw.json 收集 (base_url, api_key, default_model) 候选。
     两处配置在端口轮换后都可能过期（任一来源都不可全信）。"""
@@ -418,9 +482,18 @@ class UpstreamManager(object):
         self.cfg = cfg
         self.data_dir = cfg["lobster_data_dir"]
         self._lock = threading.Lock()
+        # _probe_lock 串行化探测（网络动作），_lock 只保护字段读写。
+        # 两者分开：probe 最坏要 1.5s×候选 + 4s chat 请求，持 _lock 期间
+        # /health 的 peek() 会一起阻塞（踩坑 10 的同类问题）。
+        self._probe_lock = threading.Lock()
         self._cached = None        # (base_url, api_key, default_model, probed_at)
         self._models_cache = None  # /v1/models 响应（探测时顺带拉取）
         self._models_at = 0.0
+        # 服务端权威目录单独缓存：它要走 HTTPS，最坏 6s，绝不能持 _lock 拉取
+        self._server_catalog = None
+        self._server_at = 0.0
+        self._server_lock = threading.Lock()
+        self._server_refreshing = False
 
     def probe(self, force=False):
         with self._lock:
@@ -428,9 +501,18 @@ class UpstreamManager(object):
             if (not force and self._cached
                     and now - self._cached[3] < int(self.cfg.get("probe_recheck_seconds", 60))):
                 return self._cached[:3]
+        # 双重检查：等锁期间别的线程可能已经探测完
+        with self._probe_lock:
+            with self._lock:
+                now = time.time()
+                if (not force and self._cached
+                        and now - self._cached[3]
+                        < int(self.cfg.get("probe_recheck_seconds", 60))):
+                    return self._cached[:3]
             cands = _collect_candidates(self.data_dir)
             if not cands:
-                self._cached = None
+                with self._lock:
+                    self._cached = None
                 return None
             base, key, model = None, None, None
             for cb, ck, cm in cands:
@@ -444,17 +526,88 @@ class UpstreamManager(object):
                         base, key, model = cb, ck, cm
                         break
             if base is None:
-                self._cached = None
+                with self._lock:
+                    self._cached = None
                 return None
             # 优先跨候选挑选稳定的 key/model（端口轮换时 key 也变，取探测通过那组的）
-            self._cached = (base, key, model, now)
-            self._models_cache = self._fetch_models_locked(base, key)
-            self._models_at = now
+            with self._lock:
+                self._cached = (base, key, model, now)
+            entries = self._fetch_models(base, key)
+            with self._lock:
+                self._models_cache = entries
+                self._models_at = now
             return base, key, model
 
-    def _fetch_models_locked(self, base, key):
-        """上游模型清单。实测该服务没有 /v1/models（404），
-        从 models.json/openclaw.json 的 provider.models 拼出 OpenAI 格式清单。"""
+    # -- 服务端权威目录（独立缓存，永不持 _lock 做网络） -------------------
+
+    def _refresh_server_catalog(self):
+        try:
+            entries = _server_model_catalog(self.data_dir)
+            if entries:
+                with self._server_lock:
+                    self._server_catalog = entries
+                    self._server_at = time.time()
+                # 换个锁再清模型缓存：_lock 与 _server_lock 不可嵌套
+                # （_catalog_entries 持 _probe_lock 时会拿 _server_lock，
+                # 反序会死锁）。
+                with self._lock:
+                    self._models_cache = None
+                log("服务端模型目录: %d 个模型" % len(entries))
+        except Exception as e:
+            log("警告: 服务端模型目录刷新失败 (%s)" % e)
+        finally:
+            with self._server_lock:
+                self._server_refreshing = False
+
+    def server_catalog(self, timeout=0, force=False):
+        """取服务端目录。
+
+        timeout<=0：只读缓存，过期时后台异步刷新（毫秒级返回，给请求路径用）。
+        timeout>0 ：在锁外等待刷新完成（最多 timeout 秒）；force 时即使有
+                    旧值也重新拉取（后台刷新线程用）。
+        """
+        with self._server_lock:
+            current = self._server_catalog
+            fresh = (current is not None
+                     and time.time() - self._server_at < 600)
+            if fresh and not force:
+                return current
+            already = self._server_refreshing
+            if timeout <= 0:
+                if not already:
+                    self._server_refreshing = True
+                spawn = not already
+            else:
+                spawn = not already
+                if spawn:
+                    self._server_refreshing = True
+        if timeout <= 0:
+            if spawn:
+                threading.Thread(target=self._refresh_server_catalog,
+                                 name="server-model-catalog", daemon=True).start()
+            with self._server_lock:
+                return self._server_catalog
+        if spawn:
+            # 在锁外做网络；内部会自行清 _server_refreshing
+            self._refresh_server_catalog()
+        else:
+            deadline = time.time() + max(0.0, float(timeout))
+            while time.time() < deadline:
+                with self._server_lock:
+                    if not self._server_refreshing:
+                        break
+                time.sleep(0.05)
+        with self._server_lock:
+            return self._server_catalog
+
+    def _fetch_models(self, base, key):
+        """上游模型清单（无锁版本，调用方须在 _probe_lock 内）。
+
+        优先级：上游 `/models`（实测 404，仅防未来变化）→ 服务端
+        `/api/models/available`（权威，带真实显示名）→ 本地 openclaw 配置。
+        绝不返回 config.json 里的 claude-* 映射别名——那些是协议转换用的
+        虚拟名，不是可提供的模型。
+        """
         upstream = None
         try:
             req = urllib.request.Request(
@@ -466,7 +619,6 @@ class UpstreamManager(object):
             upstream = None
         if isinstance(upstream, dict) and (upstream.get("data") or upstream.get("models")):
             return upstream
-        # 端点 404（或返回空清单）→ 用本地配置里的模型目录。
         entries = self._catalog_entries(base)
         if entries:
             return {"object": "list",
@@ -477,17 +629,22 @@ class UpstreamManager(object):
         return None
 
     def _catalog_entries(self, base_url):
-        """合并两处配置的 lobsterai 模型目录（按 id 去重，保序）。
+        """模型目录：服务端权威目录优先，本地 openclaw 配置兜底（按 id 去重）。
 
-        先取 baseUrl 与当前探测结果相同的目录（最可信），再补充另一处配置
-        的条目：端口轮换只改 baseUrl/apiKey，不改模型清单，全部合并才能
-        拿到完整列表（models.json 可能缺失或只含部分模型）。
+        服务端 `/api/models/available` 是客户端自己的来源，模型全集与
+        `accessible` 标记都在这里；本地 openclaw 只是它的投影，可能缺失
+        （另一台机器实测为空）或过期。两者都拿不到时才返回空（调用方再
+        回退 config 映射，仅用于 /health 展示）。
         """
-        catalogs = _collect_model_catalogs(self.data_dir)
-        if not catalogs:
-            return []
-        ordered = sorted(catalogs, key=lambda c: c[0] != base_url)
         out, seen = [], set()
+        for e in self.server_catalog() or []:
+            if e["id"] in seen:
+                continue
+            seen.add(e["id"])
+            out.append(e)
+        catalogs = _collect_model_catalogs(self.data_dir)
+        # 先取 baseUrl 与当前探测结果相同的目录（最可信），再补充另一处
+        ordered = sorted(catalogs, key=lambda c: c[0] != base_url)
         for _cb, entries in ordered:
             for e in entries:
                 if e["id"] in seen:
@@ -502,11 +659,23 @@ class UpstreamManager(object):
         if not found:
             return None
         now = time.time()
-        if self._models_cache is None or now - self._models_at > 60:
+        with self._lock:
+            cached = self._models_cache
+            stale = cached is None or now - self._models_at > 60
+        if not stale:
+            return cached
+        # 刷新也要串行化，避免多线程同时打上游
+        with self._probe_lock:
             with self._lock:
-                self._models_cache = self._fetch_models_locked(found[0], found[1])
-                self._models_at = now
-        return self._models_cache
+                cached = self._models_cache
+                stale = cached is None or time.time() - self._models_at > 60
+            if not stale:
+                return cached
+            entries = self._fetch_models(found[0], found[1])
+            with self._lock:
+                self._models_cache = entries
+                self._models_at = time.time()
+            return entries
 
     def peek(self):
         """只读当前缓存，绝不触发网络探测。
@@ -574,8 +743,23 @@ def model_limits(model_id):
     return (1000000, CONFIG["max_tokens_cap"])
 
 
+def _config_real_models():
+    """config.json 里 name == id 的映射项（真实上游 ID），不含 claude-* 别名。
+
+    别名（claude-opus-4-8 → glm-5.3）只是协议转换用的虚拟名，不是可提供的
+    模型；把它们列进 /v1/models 会让 CC-Switch 的模型选择器出现一堆不可用
+    项（另一台机器只剩 5 个兜底映射时尤其明显）。
+    """
+    out = []
+    for name, entry in (CONFIG.get("models") or {}).items():
+        mid = entry.get("id") if isinstance(entry, dict) else entry
+        if name and mid and name == mid:
+            out.append(mid)
+    return out
+
+
 def list_models():
-    """合并上游真实模型清单与 config 映射（去重，真实 ID 优先排前）。"""
+    """合并上游真实模型清单与 config 真实 ID（去重，真实模型优先）。"""
     out = []
     seen = set()
     m = UPSTREAM.models()
@@ -585,17 +769,10 @@ def list_models():
             if mid and mid not in seen:
                 seen.add(mid)
                 out.append({"id": mid, "display_name": x.get("display_name") or mid})
-    for name, entry in (CONFIG.get("models") or {}).items():
-        mid = entry.get("id") if isinstance(entry, dict) else entry
-        if name not in seen and mid not in seen and name and mid:
-            seen.add(name)
-            # 真实模型 ID（name == id）排在 claude-* 映射名前面
-            out.append({"id": name, "display_name": name,
-                        "_real": name == mid})
-    # 稳定排序：真实 ID 在前
-    out.sort(key=lambda x: not x.get("_real"))
-    for x in out:
-        x.pop("_real", None)
+    for mid in _config_real_models():
+        if mid not in seen:
+            seen.add(mid)
+            out.append({"id": mid, "display_name": mid})
     return out
 
 
@@ -608,11 +785,10 @@ def _models_from_cache(m):
         if mid and mid not in seen:
             seen.add(mid)
             out.append(mid)
-    for name, entry in (CONFIG.get("models") or {}).items():
-        mid = entry.get("id") if isinstance(entry, dict) else entry
-        if name and name not in seen:
-            seen.add(name)
-            out.append(name)
+    for mid in _config_real_models():
+        if mid not in seen:
+            seen.add(mid)
+            out.append(mid)
     return out
 
 
@@ -1791,15 +1967,28 @@ def usage_storage_selftest():
 
 
 def model_catalog_selftest():
-    """离线自检：模型目录提取/合并。
+    """离线自检：模型目录提取/合并 + 真实模型过滤。
 
-    回归「CC-Switch 获取模型不完整」：旧实现只读 models.json 的
-    providers[*].models（该文件可能缺失或过期），且匹配不到 baseUrl 时
-    返回空清单。新实现合并 openclaw.json 的完整目录。
-    不访问网络：_fetch_models_locked 的端点用 127.0.0.1:1 触发连接拒绝。
+    回归「CC-Switch 获取模型不完整 / 模型名不可用」：
+    - 旧实现只读 models.json 的 providers[*].models（可能缺失或过期），
+      匹配不到 baseUrl 时返回空清单 → 只剩 config 里 5 个映射名；
+    - 更早的 list_models 会把 config 的 claude-* 映射别名当模型返回，
+      那些是协议转换用的虚拟名，不是可提供的模型。
+    不访问网络：_fetch_models 的端点用 127.0.0.1:1 触发连接拒绝，且
+    服务端目录缓存显式置空以禁用后台拉取。
     """
     log("=== 模型目录自检 ===")
     tmp = tempfile.mkdtemp(prefix="lobster-proxy-catalog-")
+    orig_catalog = UPSTREAM._server_catalog
+    orig_at = UPSTREAM._server_at
+    orig_models_cfg = CONFIG.get("models")
+    # 源码目录没有 config.json，模型映射为空；自检自造一份，保证可重复
+    CONFIG["models"] = {
+        "deepseek-flash": {"id": "deepseek-flash", "context_window": 1000000},
+        "glm-5.3": {"id": "glm-5.3", "context_window": 1000000},
+        "claude-opus-4-8": {"id": "glm-5.3", "context_window": 1000000},
+        "claude-haiku-4-5": {"id": "deepseek-flash", "context_window": 1000000},
+    }
     try:
         state = os.path.join(tmp, "openclaw", "state")
         agent = os.path.join(state, "agents", "main", "agent")
@@ -1832,6 +2021,12 @@ def model_catalog_selftest():
         if len(catalogs) != 2:
             raise AssertionError("应收集两处配置的目录，实际 %r" % (catalogs,))
 
+        # 断言 config 里确实配了别名（否则下面的过滤用例没有意义）
+        aliases = [n for n, e in (CONFIG.get("models") or {}).items()
+                   if isinstance(e, dict) and e.get("id") and n != e.get("id")]
+        if not aliases:
+            raise AssertionError("预期 config 里有 claude-* 别名映射，实际没有")
+
         mgr = UpstreamManager(dict(CONFIG, lobster_data_dir=tmp))
         merged = mgr._catalog_entries("http://127.0.0.1:2222/v1")
         ids = [e["id"] for e in merged]
@@ -1841,17 +2036,37 @@ def model_catalog_selftest():
             raise AssertionError("匹配 baseUrl 的目录应优先：%r" % (merged[0],))
 
         # 上游 /models 不可达时必须回退到配置目录，而不是空清单
-        got = mgr._fetch_models_locked("http://127.0.0.1:1/v1", "k")
+        mgr._server_catalog = []   # 禁用服务端目录（离线）
+        got = mgr._fetch_models("http://127.0.0.1:1/v1", "k")
         got_ids = [x.get("id") for x in (got or {}).get("data") or []]
         # 该 baseUrl 与两处配置都不匹配：顺序不保证，但必须一条不少
         if sorted(got_ids) != sorted(ids):
-            raise AssertionError("_fetch_models_locked 回退不符：%r" % (got_ids,))
-        log("模型目录自检通过（两处配置合并/展示名/上游不可达回退）")
+            raise AssertionError("_fetch_models 回退不符：%r" % (got_ids,))
+
+        # 服务端目录优先于本地配置，且 config 别名不得出现在模型清单里
+        mgr._server_catalog = [
+            {"id": "server-a", "display_name": "Server A"},
+            {"id": "deepseek-flash", "display_name": "DeepSeek-V4.1-Flash"},
+        ]
+        with mgr._server_lock:
+            mgr._server_at = time.time()
+        merged2 = [e["id"] for e in mgr._catalog_entries("http://127.0.0.1:2222/v1")]
+        if merged2[0] != "server-a" or "deepseek-flash" not in merged2:
+            raise AssertionError("服务端目录应优先：%r" % (merged2,))
+
+        # _config_real_models 只保留 name == id 的真实 ID
+        real = _config_real_models()
+        if any(a in real for a in aliases):
+            raise AssertionError("config 别名不应进真实模型清单：%r" % (real,))
+        log("模型目录自检通过（两处合并/展示名/服务端优先/别名过滤）")
         return 0
     except Exception as e:
         log("模型目录自检失败: %s" % e)
         return 1
     finally:
+        CONFIG["models"] = orig_models_cfg if orig_models_cfg is not None else {}
+        UPSTREAM._server_catalog = orig_catalog
+        UPSTREAM._server_at = orig_at
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1910,11 +2125,17 @@ def resilience_selftest():
             ids = _models_from_cache(snap[1])
             if "upstream-only-model" not in ids:
                 raise AssertionError("上游模型丢失：%r" % (ids,))
-            # config 里配了模型时必须一并出现（源码目录跑自检时 models 为空，
-            # 这种环境下只校验上游部分，避免误报）
-            for name in (CONFIG.get("models") or {}):
-                if name not in ids:
-                    raise AssertionError("config 模型 %r 未合并：%r" % (name, ids))
+            # config 里 name == id 的真实模型必须一并出现；claude-* 映射别名
+            # 绝不能出现在模型清单里（它们是协议转换用的虚拟名，不是可提供
+            # 的模型——这正是「模型名疑似不是可提供的模型」的根因）。
+            for mid in _config_real_models():
+                if mid not in ids:
+                    raise AssertionError("config 真实模型 %r 未合并：%r" % (mid, ids))
+            for name, entry in (CONFIG.get("models") or {}).items():
+                mid = entry.get("id") if isinstance(entry, dict) else entry
+                if name != mid and name in ids:
+                    raise AssertionError("config 别名 %r 不应出现在模型清单：%r"
+                                         % (name, ids))
         finally:
             UPSTREAM._cached, UPSTREAM._models_cache = saved
 
@@ -1977,6 +2198,8 @@ def start_probe_refresher():
                 found = UPSTREAM.probe(force=True)
                 if found:
                     log("上游探测刷新: %s" % found[0])
+                    # 服务端模型目录走 HTTPS，必须在 _lock 之外补
+                    UPSTREAM.server_catalog(timeout=8)
             except Exception as e:
                 log("上游探测刷新失败: %s" % e)
             time.sleep(interval)
@@ -2012,6 +2235,8 @@ def main():
     found = UPSTREAM.probe()
     if found:
         log("上游就绪: %s" % found[0])
+        # 服务端目录要在首次 /v1/models 之前就绪；它在锁外，最多 8s
+        UPSTREAM.server_catalog(timeout=8)
     else:
         log("警告: 上游暂不可用（LobsterAI 未运行？），代理仍将启动并按需重探测")
 

@@ -118,7 +118,15 @@ token 策略：
 - 探活 = TCP 可连 + 最小 `POST /v1/chat/completions` 确认端点存在（上游无 `/v1/models`，HTTP 错误响应也表示服务在线）；
 - 缓存 60s；连接失败自动 force 重探测并重试一次；全挂返回 503（LobsterAI 未运行）。
 
-**模型目录**：上游 `/v1/models` 实测 404，清单只能来自本地 openclaw 配置。`_collect_model_catalogs` **合并两处配置**的 `providers[*].models`（不要求 apiKey；端口轮换不改模型清单），按 baseUrl 匹配度排序、按 id 去重后转成 OpenAI 格式（`id` + `display_name` 取配置里的 `name`），上游端点返回空 `data` 时同样回退本地目录。**不要只读 models.json**：该文件可能缺失或只含部分模型（v0.3.1 前只读它并精确匹配 baseUrl，导致 CC-Switch「获取模型」只拿到 2 个），匹配不到时还会直接返回空清单。`model_catalog_selftest()` 覆盖两处合并/展示名/上游不可达回退。
+**模型目录**：上游 `/v1/models` 实测 404，清单有三个来源，按优先级：
+
+1. **服务端 `/api/models/available`（权威）**：客户端自己就用它（asar 里 `[Auth:getModels]`），返回 `{code:0,data:[{modelId,modelName,contextWindow,accessible,restrictionHint}]}`。代理用 live `lobsterai.sqlite` 的 `kv.auth_tokens.accessToken` 鉴权（**只读 `mode=ro` 打开**，绝不在客户端运行时写 live 库）。实测 19 个模型、0.17s 返回。
+2. 本地 openclaw 配置：`_collect_model_catalogs` 合并 `models.json` 与 `openclaw.json` 两处 `providers[*].models`（不要求 apiKey），按 baseUrl 匹配度排序、按 id 去重。**不要只读 models.json**：该文件可能缺失或只含部分模型。
+3. `config.json` 里 `name == id` 的真实映射项兜底。
+
+**`claude-*` 映射别名绝不进模型清单**：它们是协议转换用的虚拟名（`claude-opus-4-8` → `glm-5.3`），请求侧仍然有效，但列进 `/v1/models` 会让 CC-Switch 的模型选择器出现不可用项——这正是「只拿到 5 个模型且模型名疑似不是可提供的模型」的根因（服务端与本地目录都拿不到时，只剩 5 个 config 映射）。`list_models` / `_models_from_cache` 统一走 `_config_real_models()` 过滤。
+
+服务端目录有独立缓存（600s）与独立锁 `_server_lock`：它会走 HTTPS（最坏 6s），**绝不能持 `_lock` 拉取**——`peek()` 也要 `_lock`，持锁会让 `/health` 超时（踩坑 10 同类）。`probe()` 的网络动作在 `_probe_lock` 内，`_lock` 只保护字段。`model_catalog_selftest()` 覆盖两处合并/展示名/服务端优先/别名过滤。
 
 **Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），schema `user_version=2`，`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`，并可迁移旧 `daily_usage` 表。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上游响应 usage 同时给出输入/输出 token，缺任一字段时整次请求按本地规则记为 `estimated`；`missing` 是迁移未知旧来源或显式缺失记录的保留口径，正常采集主要使用前两类。
 
