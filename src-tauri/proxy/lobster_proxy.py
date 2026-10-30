@@ -46,6 +46,14 @@ CONFIG_PATH = os.path.join(HERE, "config.json")
 USAGE_DB_PATH = os.path.join(HERE, "usage.sqlite")
 USAGE_SCHEMA_VERSION = 2
 
+# 客户端在响应写完之前主动断开连接时会抛出的异常。
+# 注意三者是「兄弟」而非父子关系：ConnectionAbortedError 既不是
+# BrokenPipeError 也不是 ConnectionResetError，只捕获后两者会漏掉它，
+# Windows 上客户端超时/取消时抛的正是 ConnectionAbortedError
+# [WinError 10053]，于是 socketserver 会打印一整段吓人的 traceback，
+# 而实际上代理没坏、只是对端先挂了。三者共同父类是 ConnectionError。
+CLIENT_GONE_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
 DEFAULT_CONFIG = {
     "listen_host": "127.0.0.1",
     "listen_port": 19260,
@@ -445,6 +453,21 @@ class UpstreamManager(object):
                 self._models_at = now
         return self._models_cache
 
+    def peek(self):
+        """只读当前缓存，绝不触发网络探测。
+
+        给 /health 用：健康检查必须是毫秒级返回。若走 probe()，
+        上游不在时会依次做 TCP 探活（1.5s/候选）+ 最小 chat 请求（4s），
+        远超 GUI 端 1.5s 的健康检查超时——GUI 判定代理挂了并关闭连接，
+        代理这边就报 WinError 10053。返回 (base, alive, models) 或 None。
+        """
+        with self._lock:
+            if not self._cached:
+                return None
+            base = self._cached[0]
+            m = self._models_cache
+        return base, m
+
     def upstream_model_ids(self):
         m = self.models()
         if not m:
@@ -518,6 +541,23 @@ def list_models():
     out.sort(key=lambda x: not x.get("_real"))
     for x in out:
         x.pop("_real", None)
+    return out
+
+
+def _models_from_cache(m):
+    """由（可能为 None 的）模型缓存拼出 /health 的模型名列表，不触发网络。"""
+    out = []
+    seen = set()
+    for x in (m or {}).get("data") or []:
+        mid = x.get("id")
+        if mid and mid not in seen:
+            seen.add(mid)
+            out.append(mid)
+    for name, entry in (CONFIG.get("models") or {}).items():
+        mid = entry.get("id") if isinstance(entry, dict) else entry
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
     return out
 
 
@@ -1029,6 +1069,33 @@ class Handler(BaseHTTPRequestHandler):
             sys.stdout.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
             sys.stdout.flush()
 
+    def handle_one_request(self):
+        """客户端在请求处理中途断开时，不要把整段 traceback 打进日志。
+
+        socketserver 的默认实现会在 process_request_thread 里捕获异常后
+        调用 handle_error() 打印完整堆栈。对「对端先挂」这类情况（用户取消、
+        GUI 健康检查 1.5s 超时后关连接、curl 被 Ctrl+C）完全属于正常现象，
+        却会在日志里制造看似严重的报错。这里把这类异常吞掉并记一行简报。
+        """
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except CLIENT_GONE_ERRORS as e:
+            self.close_connection = True
+            if CONFIG.get("log_requests"):
+                sys.stdout.write("[%s] 客户端提前断开（%s），忽略\n"
+                                 % (time.strftime("%H:%M:%S"), type(e).__name__))
+                sys.stdout.flush()
+
+    def handle_error(self, request, client_address):
+        """兜底：连接类异常不打印 traceback（见 handle_one_request 注释）。"""
+        import traceback
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_GONE_ERRORS):
+            self.close_connection = True
+            return
+        # 其他异常保持原样，方便排查真实故障
+        traceback.print_exc()
+
     # -- 工具方法 ---------------------------------------------------------
 
     def _check_api_key(self):
@@ -1050,13 +1117,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, obj):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
         try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
             self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_GONE_ERRORS:
+            # 客户端已断开（例如 GUI 健康检查超时后主动关闭连接，
+            # Windows 上表现为 ConnectionAbortedError/WinError 10053）。
+            # 这不是代理故障，无需打印 traceback。
             pass
 
     def _send_error_anthropic(self, status, etype, message):
@@ -1081,14 +1151,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"\r\n")
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except CLIENT_GONE_ERRORS:
             return False
 
     def _end_chunked(self):
         try:
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except CLIENT_GONE_ERRORS:
             pass
 
     # -- 路由（归一化 /v1 前缀） -------------------------------------------
@@ -1105,13 +1175,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self._norm(self.path)
         if path in ("/health", "/healthz", "/"):
-            found = UPSTREAM.probe()
+            # 只用缓存，不做网络探测：本接口被 GUI 以 1.5s 超时轮询，
+            # 一旦在这里同步探上游（最坏 1.5s×候选数 + 4s），必然超时，
+            # 客户端先断 → ConnectionAbortedError 刷屏。缓存由启动探测
+            # 与后台刷新线程维护（见 start_probe_refresher）。
+            snap = UPSTREAM.peek()
+            base, models_cache = (snap if snap else (None, None))
             self._send_json(200, {
                 "status": "ok",
-                "upstream": found[0] if found else None,
-                "upstream_alive": bool(found),
+                "upstream": base,
+                "upstream_alive": bool(base),
                 "default_model": CONFIG["default_model"],
-                "models": [m["id"] for m in list_models()],
+                "models": _models_from_cache(models_cache),
             })
             return
         if path in ("/models",):
@@ -1315,7 +1390,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
-                except (BrokenPipeError, ConnectionResetError):
+                except CLIENT_GONE_ERRORS:
                     pass
                 return
         # 真非流式（未来上游修复后）：解析统计后原样转发
@@ -1335,7 +1410,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_GONE_ERRORS:
             pass
 
     @staticmethod
@@ -1660,9 +1735,80 @@ def usage_storage_selftest():
                 pass
 
 
+def resilience_selftest():
+    """离线自检：客户端断连容错 / 健康检查不阻塞 / 缓存快照。
+
+    不访问网络，可在任意机器跑（--selftest-storage 会一并调用）。
+    """
+    log("=== 连接容错自检 ===")
+    try:
+        # 1) 三个「对端已断开」异常都必须被 CLIENT_GONE_ERRORS 覆盖
+        for exc in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            if not issubclass(exc, CLIENT_GONE_ERRORS):
+                raise AssertionError("CLIENT_GONE_ERRORS 未覆盖 %s" % exc.__name__)
+        # 10053 (WSAECONNABORTED) 必须映射到被捕获的类型
+        e = ConnectionAbortedError(10053, "客户端已断开")
+        if not isinstance(e, CLIENT_GONE_ERRORS):
+            raise AssertionError("WinError 10053 未被捕获")
+        if isinstance(e, (BrokenPipeError, ConnectionResetError)):
+            raise AssertionError("预期前提不成立：Aborted 不应该是 Pipe/Reset 的子类")
+
+        # 2) /health 用的 peek() 在无缓存时必须立即返回 None，且绝不发起网络请求
+        saved = (UPSTREAM._cached, UPSTREAM._models_cache)
+        calls = {"n": 0}
+        orig_port_open = globals()["_port_open"]
+
+        def trap(*a, **kw):
+            calls["n"] += 1
+            raise AssertionError("peek() 触发了网络探测（%s）" % (a,))
+
+        try:
+            UPSTREAM._cached = None
+            UPSTREAM._models_cache = None
+            globals()["_port_open"] = trap
+            t0 = time.time()
+            snap = UPSTREAM.peek()
+            cost = time.time() - t0
+            if snap is not None:
+                raise AssertionError("空缓存时 peek() 应返回 None，实际 %r" % (snap,))
+            if calls["n"]:
+                raise AssertionError("peek() 不应触发网络探测")
+            if cost > 0.05:
+                raise AssertionError("peek() 太慢：%.3fs，健康检查会超时" % cost)
+        finally:
+            globals()["_port_open"] = orig_port_open
+            UPSTREAM._cached, UPSTREAM._models_cache = saved
+
+        # 3) 有缓存时 peek() 原样返回，且 _models_from_cache 含上游模型
+        UPSTREAM._cached = ("http://127.0.0.1:1/v1", "k", "m", time.time())
+        UPSTREAM._models_cache = {"data": [{"id": "upstream-only-model"}]}
+        try:
+            snap = UPSTREAM.peek()
+            if not snap or snap[0] != "http://127.0.0.1:1/v1":
+                raise AssertionError("peek() 未返回缓存的上游地址：%r" % (snap,))
+            ids = _models_from_cache(snap[1])
+            if "upstream-only-model" not in ids:
+                raise AssertionError("上游模型丢失：%r" % (ids,))
+            # config 里配了模型时必须一并出现（源码目录跑自检时 models 为空，
+            # 这种环境下只校验上游部分，避免误报）
+            for name in (CONFIG.get("models") or {}):
+                if name not in ids:
+                    raise AssertionError("config 模型 %r 未合并：%r" % (name, ids))
+        finally:
+            UPSTREAM._cached, UPSTREAM._models_cache = saved
+
+        log("连接容错自检通过（10053 捕获/健康检查零阻塞/缓存合并）")
+        return 0
+    except Exception as e:
+        log("连接容错自检失败: %s" % e)
+        return 1
+
+
 def selftest():
     log("=== 自检 ===")
     if usage_storage_selftest():
+        return 1
+    if resilience_selftest():
         return 1
     found = UPSTREAM.probe(force=True)
     if not found:
@@ -1696,12 +1842,36 @@ def selftest():
 # 入口
 # --------------------------------------------------------------------------
 
+def start_probe_refresher():
+    """后台定期刷新上游探测缓存，让 /health 永远只读缓存、毫秒级返回。
+
+    间隔取 probe_recheck_seconds（默认 60s）。探测失败不退出线程：
+    用户可能稍后才启动 LobsterAI，下次循环会再试。
+    """
+    interval = max(5, int(CONFIG.get("probe_recheck_seconds", 60)))
+
+    def loop():
+        while True:
+            try:
+                found = UPSTREAM.probe(force=True)
+                if found:
+                    log("上游探测刷新: %s" % found[0])
+            except Exception as e:
+                log("上游探测刷新失败: %s" % e)
+            time.sleep(interval)
+
+    t = threading.Thread(target=loop, name="upstream-probe-refresher")
+    t.daemon = True
+    t.start()
+    return t
+
+
 def main():
     if "--selftest-storage" in sys.argv:
         try:
-            success = usage_storage_selftest() == 0
+            success = usage_storage_selftest() == 0 and resilience_selftest() == 0
         except BaseException as e:
-            log("统计存储自检失败（未处理异常）: %s" % e)
+            log("存储/容错自检失败（未处理异常）: %s" % e)
             success = False
         return 0 if success else 1
     if "--selftest" in sys.argv:
@@ -1730,6 +1900,7 @@ def main():
         sys.exit(1)
 
     httpd.daemon_threads = True
+    start_probe_refresher()
     log("LobsterPlus 稳定代理已启动: http://%s:%d" % (host, port))
     log("  OpenAI   : http://%s:%d/v1/chat/completions" % (host, port))
     log("  Anthropic: http://%s:%d/v1/messages" % (host, port))

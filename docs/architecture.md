@@ -130,7 +130,7 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 | GET /v1/models | OpenAI | 上游清单 + config 映射合并 |
 | POST /v1/messages | Anthropic | → OpenAI 转换（fork raccoon 转换层：system/messages/tools/tool_result 互转 + SSE 事件发射器 + thinking） |
 | POST /v1/messages/count_tokens | Anthropic | 估算 |
-| GET /health | — | 状态 + 上游探测结果 |
+| GET /health | — | 状态 + 上游探测结果（**只读内存缓存**，绝不发起网络探测；缓存由启动探测与后台刷新线程维护，保证 GUI 1.5s 超时内返回） |
 
 模型映射：上游存在的 ID 直通；`claude-*` 前缀按 config models 映射（默认 opus→glm-5.3、sonnet/haiku→deepseek-flash）；兜底 default_model。
 
