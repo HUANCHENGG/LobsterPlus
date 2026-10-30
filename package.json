@@ -1,7 +1,7 @@
 {
   "name": "lobster-plus",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "LobsterAI 多账号切换器：多账号切换保留对话记录、全库每日自动签到、本地 API 稳定代理",
   "type": "module",
   "scripts": {

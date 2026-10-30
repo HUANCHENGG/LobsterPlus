@@ -118,6 +118,8 @@ token 策略：
 - 探活 = TCP 可连 + 最小 `POST /v1/chat/completions` 确认端点存在（上游无 `/v1/models`，HTTP 错误响应也表示服务在线）；
 - 缓存 60s；连接失败自动 force 重探测并重试一次；全挂返回 503（LobsterAI 未运行）。
 
+**模型目录**：上游 `/v1/models` 实测 404，清单只能来自本地 openclaw 配置。`_collect_model_catalogs` **合并两处配置**的 `providers[*].models`（不要求 apiKey；端口轮换不改模型清单），按 baseUrl 匹配度排序、按 id 去重后转成 OpenAI 格式（`id` + `display_name` 取配置里的 `name`），上游端点返回空 `data` 时同样回退本地目录。**不要只读 models.json**：该文件可能缺失或只含部分模型（v0.3.1 前只读它并精确匹配 baseUrl，导致 CC-Switch「获取模型」只拿到 2 个），匹配不到时还会直接返回空清单。`model_catalog_selftest()` 覆盖两处合并/展示名/上游不可达回退。
+
 **Token usage**：Python 代理写 `~\.lobster-plus\proxy\usage.sqlite`（即脚本同目录；`LOBSTER_PLUS_HOME` 沙箱下随根目录变化），schema `user_version=2`，`usage_daily` 以 `(day, protocol, model)` 为主键，累计 `input/output/request/success/error/accurate/estimated/missing`，并可迁移旧 `daily_usage` 表。仅保留本地日聚合、协议和模型名，不保存请求/响应内容或密钥；统计写入失败不影响转发。`accurate` 表示上游响应 usage 同时给出输入/输出 token，缺任一字段时整次请求按本地规则记为 `estimated`；`missing` 是迁移未知旧来源或显式缺失记录的保留口径，正常采集主要使用前两类。
 
 Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据库不存在时返回空报告；范围仅支持 `today`、`7d`、`30d`、`all`，返回总计、按日和按模型汇总。前端入口在代理卡片的“今日用量”摘要及“用量详情”按钮，详情还展示准确/估算/缺失请求数和日趋势。
@@ -135,7 +137,7 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 模型映射：上游存在的 ID 直通；`claude-*` 前缀按 config models 映射（默认 opus→glm-5.3、sonnet/haiku→deepseek-flash）；兜底 default_model。
 
 **CC-Switch 注册**（register.rs，移植 add_provider.py）：
-备份 `~\.cc-switch\cc-switch.db` → upsert provider「LobsterPlus(本地)」（apiFormat=anthropic native、`ANTHROPIC_BASE_URL=http://127.0.0.1:19260`、模型全映射）→ 还原写入前激活项（`--switch` 才切换）。Python 发现三级：PATH → `%APPDATA%\LobsterAI\runtimes\python-win\` → py.exe；候选必须能实际启动，不能把 Windows Store App Execution Alias 当成真实解释器。
+备份 `~\.cc-switch\cc-switch.db` → upsert provider「LobsterPlus(本地)」（apiFormat=anthropic native、`ANTHROPIC_BASE_URL=http://127.0.0.1:19260`、模型全映射）→ 还原写入前激活项（`--switch` 才切换）。**meta 不写 `isFullUrl`**：代理直接说 Anthropic 协议，CC-Switch 自行拼 `/v1/messages` 即可；写了反而让模型获取走「从完整 URL 推导」分支，对裸 host 报 `Cannot derive models endpoint from full URL`（`meta_keeps_direct_url_semantics` 回归）。Python 发现三级：PATH → `%APPDATA%\LobsterAI\runtimes\python-win\` → py.exe；候选必须能实际启动，不能把 Windows Store App Execution Alias 当成真实解释器。
 
 ## 四、安全红线
 

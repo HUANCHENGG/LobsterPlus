@@ -296,6 +296,51 @@ def _pick_model(p):
     return models[0].get("id")
 
 
+def _model_entries_from_provider(p):
+    """提取 provider 的模型目录（真实 ID + 展示名）。
+
+    上游真实 ID 才是可调用的键；name（如 DeepSeek-V4.1-Flash）只用于展示。
+    CC-Switch 的模型选择器只读 id，但其他客户端会展示 display_name。
+    """
+    out = []
+    for m in p.get("models") or []:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        mid = str(m["id"])
+        out.append({
+            "id": mid,
+            "display_name": str(m.get("name") or m.get("display_name") or mid),
+        })
+    return out
+
+
+def _collect_model_catalogs(data_dir):
+    """从 models.json 与 openclaw.json 收集 (base_url, [模型目录])。
+
+    与 _collect_candidates 不同，这里不要求 apiKey：模型目录本身与鉴权无关，
+    即使某一处 baseUrl 已过期，模型清单仍然有效（端口轮换不动模型列表）。
+    """
+    out = []
+    mf = os.path.join(data_dir, "openclaw", "state", "agents", "main", "agent", "models.json")
+    cfg = _load_json(mf)
+    if cfg and cfg.get("providers"):
+        for pid, p in cfg["providers"].items():
+            if "lobsterai" not in pid.lower() and p.get("api") != "lobsterai-model-compat":
+                continue
+            entries = _model_entries_from_provider(p)
+            if p.get("baseUrl") and entries:
+                out.append((p["baseUrl"], entries))
+    oc = _load_json(os.path.join(data_dir, "openclaw", "state", "openclaw.json"))
+    if oc:
+        for pid, p in ((oc.get("models", {}) or {}).get("providers", {}) or {}).items():
+            if "lobsterai" not in pid.lower():
+                continue
+            entries = _model_entries_from_provider(p)
+            if p.get("baseUrl") and entries:
+                out.append((p["baseUrl"], entries))
+    return out
+
+
 def _collect_candidates(data_dir):
     """从 models.json 与 openclaw.json 收集 (base_url, api_key, default_model) 候选。
     两处配置在端口轮换后都可能过期（任一来源都不可全信）。"""
@@ -409,37 +454,47 @@ class UpstreamManager(object):
 
     def _fetch_models_locked(self, base, key):
         """上游模型清单。实测该服务没有 /v1/models（404），
-        从配置候选里的 models 列表拼出 OpenAI 格式清单。"""
-        for cb, ck, cm in _collect_candidates(self.data_dir):
-            if cb == base:
-                try:
-                    req = urllib.request.Request(
-                        cb.rstrip("/") + "/models",
-                        headers={"Authorization": "Bearer " + ck})
-                    with urllib.request.urlopen(req, timeout=4) as resp:
-                        return json.loads(resp.read().decode("utf-8", "replace"))
-                except Exception:
-                    pass
-                # 端点 404 → 用配置里的模型列表
-                ids = self._model_ids_from_candidates(base)
-                if ids is not None:
-                    return {"object": "list",
-                            "data": [{"id": i, "type": "model"} for i in ids]}
+        从 models.json/openclaw.json 的 provider.models 拼出 OpenAI 格式清单。"""
+        upstream = None
+        try:
+            req = urllib.request.Request(
+                base.rstrip("/") + "/models",
+                headers={"Authorization": "Bearer " + key})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                upstream = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            upstream = None
+        if isinstance(upstream, dict) and (upstream.get("data") or upstream.get("models")):
+            return upstream
+        # 端点 404（或返回空清单）→ 用本地配置里的模型目录。
+        entries = self._catalog_entries(base)
+        if entries:
+            return {"object": "list",
+                    "data": [{"id": e["id"], "type": "model",
+                              "display_name": e["display_name"]} for e in entries]}
+        if isinstance(upstream, dict):
+            return upstream
         return None
 
-    def _model_ids_from_candidates(self, base_url):
-        for cb, _ck, _cm in _collect_candidates(self.data_dir):
-            if cb != base_url:
-                continue
-            mf = os.path.join(self.data_dir, "openclaw", "state", "agents",
-                              "main", "agent", "models.json")
-            cfg = _load_json(mf)
-            if cfg and cfg.get("providers"):
-                for pid, p in cfg["providers"].items():
-                    if p.get("baseUrl") == cb and p.get("models"):
-                        return [m.get("id") for m in p["models"] if m.get("id")]
-            return []  # 匹配到候选但无模型列表
-        return None
+    def _catalog_entries(self, base_url):
+        """合并两处配置的 lobsterai 模型目录（按 id 去重，保序）。
+
+        先取 baseUrl 与当前探测结果相同的目录（最可信），再补充另一处配置
+        的条目：端口轮换只改 baseUrl/apiKey，不改模型清单，全部合并才能
+        拿到完整列表（models.json 可能缺失或只含部分模型）。
+        """
+        catalogs = _collect_model_catalogs(self.data_dir)
+        if not catalogs:
+            return []
+        ordered = sorted(catalogs, key=lambda c: c[0] != base_url)
+        out, seen = [], set()
+        for _cb, entries in ordered:
+            for e in entries:
+                if e["id"] in seen:
+                    continue
+                seen.add(e["id"])
+                out.append(e)
+        return out
 
     def models(self):
         """上游模型列表（缓存 60s）。LobsterAI 不在运行时返回 None。"""
@@ -1735,6 +1790,72 @@ def usage_storage_selftest():
                 pass
 
 
+def model_catalog_selftest():
+    """离线自检：模型目录提取/合并。
+
+    回归「CC-Switch 获取模型不完整」：旧实现只读 models.json 的
+    providers[*].models（该文件可能缺失或过期），且匹配不到 baseUrl 时
+    返回空清单。新实现合并 openclaw.json 的完整目录。
+    不访问网络：_fetch_models_locked 的端点用 127.0.0.1:1 触发连接拒绝。
+    """
+    log("=== 模型目录自检 ===")
+    tmp = tempfile.mkdtemp(prefix="lobster-proxy-catalog-")
+    try:
+        state = os.path.join(tmp, "openclaw", "state")
+        agent = os.path.join(state, "agents", "main", "agent")
+        os.makedirs(agent, exist_ok=True)
+        # models.json：只有 2 个模型（模拟过期/不完整）
+        with open(os.path.join(agent, "models.json"), "w", encoding="utf-8") as f:
+            json.dump({"providers": {"lobsterai-server": {
+                "baseUrl": "http://127.0.0.1:1111/v1",
+                "apiKey": "old-key",
+                "models": [{"id": "deepseek-flash", "name": "DeepSeek-Flash"},
+                           {"id": "glm-5.3", "name": "GLM-5.3"}],
+            }}}, f)
+        # openclaw.json：完整 3 个模型，baseUrl 与新端口一致（无 apiKey 也要收集目录）
+        with open(os.path.join(state, "openclaw.json"), "w", encoding="utf-8") as f:
+            json.dump({"models": {"providers": {"lobsterai-server": {
+                "baseUrl": "http://127.0.0.1:2222/v1",
+                "models": [{"id": "deepseek-flash", "name": "DeepSeek-V4.1-Flash"},
+                           {"id": "kimi-k3.1-pro", "name": "Kimi-K3.1-Pro"},
+                           {"id": "MiniMax-M3", "name": "MiniMax-M3"}],
+            }}}}, f)
+
+        entries = _model_entries_from_provider({
+            "models": [{"id": "a", "name": "A"}, {"id": ""}, "junk",
+                       {"id": "b"}]})
+        if entries != [{"id": "a", "display_name": "A"},
+                       {"id": "b", "display_name": "b"}]:
+            raise AssertionError("provider 模型解析不符：%r" % (entries,))
+
+        catalogs = _collect_model_catalogs(tmp)
+        if len(catalogs) != 2:
+            raise AssertionError("应收集两处配置的目录，实际 %r" % (catalogs,))
+
+        mgr = UpstreamManager(dict(CONFIG, lobster_data_dir=tmp))
+        merged = mgr._catalog_entries("http://127.0.0.1:2222/v1")
+        ids = [e["id"] for e in merged]
+        if ids != ["deepseek-flash", "kimi-k3.1-pro", "MiniMax-M3", "glm-5.3"]:
+            raise AssertionError("目录合并顺序/去重不符：%r" % (ids,))
+        if merged[0]["display_name"] != "DeepSeek-V4.1-Flash":
+            raise AssertionError("匹配 baseUrl 的目录应优先：%r" % (merged[0],))
+
+        # 上游 /models 不可达时必须回退到配置目录，而不是空清单
+        got = mgr._fetch_models_locked("http://127.0.0.1:1/v1", "k")
+        got_ids = [x.get("id") for x in (got or {}).get("data") or []]
+        # 该 baseUrl 与两处配置都不匹配：顺序不保证，但必须一条不少
+        if sorted(got_ids) != sorted(ids):
+            raise AssertionError("_fetch_models_locked 回退不符：%r" % (got_ids,))
+        log("模型目录自检通过（两处配置合并/展示名/上游不可达回退）")
+        return 0
+    except Exception as e:
+        log("模型目录自检失败: %s" % e)
+        return 1
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def resilience_selftest():
     """离线自检：客户端断连容错 / 健康检查不阻塞 / 缓存快照。
 
@@ -1869,7 +1990,9 @@ def start_probe_refresher():
 def main():
     if "--selftest-storage" in sys.argv:
         try:
-            success = usage_storage_selftest() == 0 and resilience_selftest() == 0
+            success = (usage_storage_selftest() == 0
+                       and resilience_selftest() == 0
+                       and model_catalog_selftest() == 0)
         except BaseException as e:
             log("存储/容错自检失败（未处理异常）: %s" % e)
             success = False

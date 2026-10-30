@@ -104,12 +104,7 @@ pub fn register(paths: &Paths, make_current: bool) -> Result<Value, String> {
 
     let env = build_env(&base_url, &token, &model);
     let settings_config = json!({ "env": env });
-    let meta = json!({
-        "commonConfigEnabled": true,
-        "endpointAutoSelect": true,
-        "apiFormat": "anthropic",
-        "isFullUrl": true,
-    });
+    let meta = build_meta();
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     let pid = {
@@ -217,6 +212,22 @@ fn build_env(base_url: &str, token: &str, model: &str) -> Value {
     })
 }
 
+/// provider.meta：代理是原生 Anthropic 协议，`ANTHROPIC_BASE_URL` 只填到
+/// 端口（不含 `/v1`），由 CC-Switch 自行拼 `/v1/messages`。
+///
+/// **不要写 `isFullUrl: true`**：该开关会让 CC-Switch 把 base_url 当作完整
+/// 端点原样使用（拼接路径被跳过），同时模型获取会走「从完整 URL 推导
+/// models 端点」分支——对 `http://127.0.0.1:19260` 这种裸 host 直接报
+/// "Cannot derive models endpoint from full URL"，用户点「获取模型」必然失败。
+/// 代理本来就说 Anthropic 协议，直连语义即可，不需要任何 URL 改写。
+fn build_meta() -> Value {
+    json!({
+        "commonConfigEnabled": true,
+        "endpointAutoSelect": true,
+        "apiFormat": "anthropic",
+    })
+}
+
 /// 从代理 /health 的模型清单挑默认模型。
 /// 优先真实上游 ID（deepseek-flash 系），避免把 claude-* 映射名写进 CC-Switch
 /// （CC-Switch 里显示映射名会让用户误以为直接可用）。
@@ -256,5 +267,14 @@ mod tests {
         let env = build_env("http://127.0.0.1:19260", "k", "deepseek-flash");
         assert_eq!(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:19260");
         assert_eq!(env["ANTHROPIC_MODEL"], "deepseek-flash");
+    }
+
+    /// 回归：isFullUrl 会让 CC-Switch 无法从裸 host 推导 /v1/models，
+    /// 「获取模型」直接报错；apiFormat 必须是 anthropic（原生协议）。
+    #[test]
+    fn meta_keeps_direct_url_semantics() {
+        let meta = build_meta();
+        assert_eq!(meta["apiFormat"], "anthropic");
+        assert!(meta.get("isFullUrl").is_none(), "meta: {meta}");
     }
 }
