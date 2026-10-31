@@ -157,19 +157,24 @@ function proxyCard() {
   const p = state.proxy || {};
   const running = !!p.running;
   const upstreamOk = p.upstream_alive === true;
+  const restricted = p.account_restricted === true;
   const port = p.port || 19260;
   const upstream = p.upstream ? esc(p.upstream) : "—";
+  const restrictedChip = restricted
+    ? `<span class="chip danger" title="${esc(p.account_message || "")}"><span class="dot"></span>${t("chipAccountRestricted")}${p.account_restricted_until ? ` · ${esc(p.account_restricted_until)}` : ""}</span>`
+    : "";
   return `
-  <div class="card proxy-card ${running ? "active" : ""}">
+  <div class="card proxy-card ${running ? "active" : ""} ${restricted ? "restricted" : ""}">
     <div class="card-top">
       <span class="card-name">${ic("plug", 15)} ${t("proxyTitle")}</span>
       <span class="health ${running ? "ok" : ""}"><span class="dot"></span>${running ? t("chipProxyOn") : t("chipProxyOff")}</span>
     </div>
     <div class="card-sub">${t("proxyDesc")}</div>
+    ${restricted ? `<div class="proxy-restricted-note">${ic("alert", 13)} ${esc(p.account_message || t("accountRestrictedHint"))}${p.account_restricted_until ? `<br><b>${t("accountRestrictedUntil")}: ${esc(p.account_restricted_until)}</b>` : ""}</div>` : ""}
     <div class="proxy-urls">
       <span class="proxy-url"><b>${t("proxyOpenaiUrl")}</b><code>http://127.0.0.1:${port}/v1/chat/completions</code></span>
       <span class="proxy-url"><b>${t("proxyAnthropicUrl")}</b><code>http://127.0.0.1:${port}/v1/messages</code></span>
-      <span class="proxy-url"><b>${t("proxyUpstream")}</b><code>${upstream}</code> ${running ? (upstreamOk ? `<span class="chip on"><span class="dot"></span>${t("chipUpstreamOk")}</span>` : `<span class="chip warn"><span class="dot"></span>${t("chipUpstreamDown")}</span>`) : ""}</span>
+      <span class="proxy-url"><b>${t("proxyUpstream")}</b><code>${upstream}</code> ${running ? (upstreamOk ? `<span class="chip on"><span class="dot"></span>${t("chipUpstreamOk")}</span>` : `<span class="chip warn"><span class="dot"></span>${restricted ? t("chipUpstreamRestricted") : t("chipUpstreamDown")}</span>`) : ""} ${restrictedChip}</span>
       ${running && p.model_count != null ? `<span class="proxy-url"><b>${t("proxyModels")}</b><code>${p.model_count}</code>${p.stale ? `<span class="chip warn"><span class="dot"></span>${t("versionProxyStaleShort")}</span>` : ""}</span>` : ""}
     </div>
     <div class="proxy-usage-row">

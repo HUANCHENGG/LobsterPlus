@@ -38,6 +38,14 @@ pub struct ProxyStatus {
     pub stale: bool,
     /// 代理当前能提供的模型数（/health 的 models 长度），用于自检清单是否完整
     pub model_count: Option<usize>,
+    /// 账号风控状态（/health 的 account.state）：OK / TEMP_RESTRICTED / ...
+    pub account_state: Option<String>,
+    /// 账号被限制时的解禁时间（人类可读，来自 /health restricted_until_text）
+    pub account_restricted_until: Option<String>,
+    /// 账号被限制时的原始说明（不含凭据）
+    pub account_message: Option<String>,
+    /// 账号当前是否处于限制窗口（/health 的 account_restricted）
+    pub account_restricted: bool,
 }
 
 /// 代理脚本版本（与 lobster_proxy.py 的 PROXY_SCRIPT_VERSION 保持一致）。
@@ -150,6 +158,25 @@ pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
                 .get("models")
                 .and_then(|m| m.as_array())
                 .map(|a| a.len());
+            // 账号风控状态：老脚本没有该字段，按 OK 处理
+            let account = v.get("account");
+            let account_state = account
+                .and_then(|a| a.get("state"))
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            let account_restricted_until = account
+                .and_then(|a| a.get("restricted_until_text"))
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            let account_message = account
+                .and_then(|a| a.get("message"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let account_restricted = v
+                .get("account_restricted")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
             Ok(ProxyStatus {
                 running: true,
                 port,
@@ -160,6 +187,10 @@ pub fn health(paths: &Paths) -> Result<ProxyStatus, String> {
                 expected_version: Some(SCRIPT_VERSION.to_string()),
                 stale,
                 model_count,
+                account_state,
+                account_restricted_until,
+                account_message,
+                account_restricted,
             })
         }
         _ => Ok(ProxyStatus {

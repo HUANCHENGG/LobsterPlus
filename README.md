@@ -24,8 +24,9 @@ LobsterAI 的对话库（`cowork_sessions`/`cowork_messages`）没有账号字�
 
 LobsterAI 自带本地 OpenAI 兼容代理，但**端口和 apiKey 随每次重启轮换**（3248→3858→2880→1316…），接 CC-Switch 一配就失效。LobsterPlus 监听**固定端口 19260**：
 
-- 自动探测当前轮换的本地端口/key（models.json + openclaw.json 双候选 + TCP/最小 chat 请求探活），轮换对调用方彻底透明；
+- 自动探测当前轮换的本地端口/key（models.json + openclaw.json 双候选 + TCP/GET 元数据探活），轮换对调用方彻底透明；**探活不发真实 chat 请求**，账号被风控限制时自动熔断、不再打上游；
 - 双协议：`/v1/chat/completions`（OpenAI）+ `/v1/messages`（Anthropic 协议转换，Claude Code 可直连）+ `/v1/models` + `/health`；
+- 上游错误按真实语义回传（账号限制 403 / 限流 429 / 余额 402 / 其他 502），不再把错误 SSE 包成 HTTP 200 让客户端误报「格式转换错误」；
 - 本地按日统计请求与输入/输出 Token，区分上游准确 usage 和本地估算，支持今日、7 天、30 天、全部范围及按模型汇总；只保存聚合数据，不保存请求/响应正文或密钥；
 - **一键注册进 CC-Switch**（备份 db 后 SQL upsert provider，非破坏性），Base URL 填 `http://127.0.0.1:19260` 永不漂移。
 
@@ -73,9 +74,34 @@ lobster-plus.exe --cli <子命令>
 | `default_model` | `deepseek-flash` | 未匹配到模型时的兜底上游模型 |
 | `api_key` | 空 | 代理自身 Bearer 鉴权；留空=不校验（仅监听 127.0.0.1） |
 | `models` | 见模板 | 模型名映射，`claude-*` 别名 → 上游真实 ID |
-| `probe_recheck_seconds` | 60 | 上游端口/key 重探测间隔 |
+| `probe_recheck_seconds` | 300 | 按需探测的缓存有效期（仅真实请求触发） |
+| `probe_refresh_seconds` | 0 | 后台探活间隔；**0=关闭（默认，代理不主动探测活跃度）** |
+| `probe_mode` | `metadata` | `metadata`=只做 TCP+GET（不发真实 chat、不耗额度）；`chat` 仅排障用 |
+| `catalog_backoff_max_seconds` | 3600 | 服务端模型目录拉取失败后的退避上限 |
 
 改完配置需要重启代理（GUI 的「停止代理 / 启动代理」）。账号库路径可用环境变量 `LOBSTER_PLUS_HOME` 重定向，凭据加密密钥用 `LOBSTER_PLUS_CREDENTIAL_SECRET`。
+
+## 账号风控与使用边界
+
+有道龙虾服务端会对「第三方反向代理/插件转接、共享账号额度」做风控。触发后接口返回：
+
+```json
+{"code":40302,"data":{"accountAccess":{"state":"TEMP_RESTRICTED",
+ "restrictedUntil":"2026-10-31T08:57:05Z","message":"账号暂时无法使用相关服务…"}}}
+```
+
+此时**任何客户端**（包括官方 LobsterAI 本体）都无法使用该账号，直到解禁时间。
+
+**触发记录**：本机客户端一直是 2026.9.23（未升级；2026.10.23 更新包 10-28 已下载但未安装）。代理于 10-29 13:55 起以 60 秒间隔持续发送真实 chat 探活，约 27 小时后（10-30 16:57）账号被限制——时间线与「自动化探活 + 第三方转发」高度吻合，与客户端更新无关。
+
+代理的行为（v0.3.5 起）：
+
+- 识别 `40302` / `TEMP_RESTRICTED`（HTTP JSON 与 SSE 两种载体都能识别）；
+- **立即停止一切上游请求**，直到解禁；后台探活默认关闭，代理不主动探测活跃度，一切上游请求都由真实调用触发；
+- 对调用方返回 **HTTP 403**（不是 200）并带上真实原因与解禁时间；
+- `/health` 的 `account.state` 与 `account_restricted` 同步反映，GUI 卡片显示红色提示，`doctor` 增加 `account_restriction` 检查项。
+
+**这只能止损，不能规避风控。** 把 LobsterAI 个人账号的额度转给 CC-Switch / Claude Code / ZCode 等第三方客户端使用本身违反其服务条款；持续异常使用可能导致永久停用。长期稳定使用 coding agent 请直接使用各模型厂商的官方 API。
 
 ## 安全设计
 
@@ -90,7 +116,7 @@ lobster-plus.exe --cli <子命令>
 scripts\build-release.cmd   （前端 + release exe，GNU 工具链）
 npm ci && npm run tauri dev   （开发模式）
 cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features   （Rust 单元测试）
-"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage   （代理三项自检：用量存储/连接容错/模型目录）
+"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage   （代理四项自检：用量存储/连接容错/模型目录/账号风控）
 ```
 
 发布安装包（需本机已装 NSIS）：

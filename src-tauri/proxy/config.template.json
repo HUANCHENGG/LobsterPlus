@@ -10,7 +10,12 @@
   "max_tokens_cap": 100000,
   "request_timeout": 330,
   "log_requests": true,
-  "probe_recheck_seconds": 60,
+
+  "_comment_probe": "probe_recheck_seconds=按需探测的缓存有效期（仅有真实请求时触发）；probe_refresh_seconds=后台探活间隔，0=关闭（默认，代理不主动探测活跃度）；probe_mode=metadata 只做 TCP+GET（不发真实 chat、不耗额度），chat 仅排障用；catalog_backoff_max_seconds=模型目录拉取失败退避上限",
+  "probe_recheck_seconds": 300,
+  "probe_refresh_seconds": 0,
+  "probe_mode": "metadata",
+  "catalog_backoff_max_seconds": 3600,
 
   "_comment_l2": "代理自身鉴权（Bearer）。留空 = 不校验（仅监听 127.0.0.1）。注册 CC-Switch 时会带上。",
   "api_key": "",

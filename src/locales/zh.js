@@ -13,6 +13,8 @@ export const zh = {
   chipProxyOff: "API 代理未运行",
   chipUpstreamOk: "上游已探测",
   chipUpstreamDown: "上游不可用",
+  chipUpstreamRestricted: "账号受限",
+  chipAccountRestricted: "账号被限制",
 
   // 工具栏
   captureCurrent: "收编当前登录",
@@ -24,6 +26,8 @@ export const zh = {
   // 代理卡片
   proxyTitle: "本地 API 稳定代理",
   proxyDesc: "固定端口转发 LobsterAI 本地模型服务（端口/key 随重启轮换的痛点被彻底屏蔽）。",
+  accountRestrictedHint: "有道龙虾服务端限制了本账号的第三方转发使用，代理已暂停所有上游请求。",
+  accountRestrictedUntil: "预计恢复",
   proxyOpenaiUrl: "OpenAI",
   proxyAnthropicUrl: "Anthropic",
   proxyModels: "可用模型",

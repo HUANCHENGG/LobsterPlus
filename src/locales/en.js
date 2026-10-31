@@ -13,6 +13,8 @@ export const en = {
   chipProxyOff: "API proxy off",
   chipUpstreamOk: "Upstream detected",
   chipUpstreamDown: "Upstream unavailable",
+  chipUpstreamRestricted: "Account restricted",
+  chipAccountRestricted: "Account restricted",
 
   // Toolbar
   captureCurrent: "Capture current login",
@@ -24,6 +26,8 @@ export const en = {
   // Proxy card
   proxyTitle: "Local API stabilizer proxy",
   proxyDesc: "Forwards the LobsterAI local model service on a fixed port (the rotating port/key pain point is fully hidden).",
+  accountRestrictedHint: "Youdao LobsterAI has restricted third-party relay use for this account. The proxy has paused all upstream requests.",
+  accountRestrictedUntil: "Expected recovery",
   proxyOpenaiUrl: "OpenAI",
   proxyAnthropicUrl: "Anthropic",
   proxyModels: "Models",

@@ -367,6 +367,37 @@ fn doctor(paths: &Paths) -> Value {
         Err(e) => items.push(("lobsterplus_proxy".into(), false, e)),
     }
 
+    // 账号风控状态：受限时上游虽然端口活着，但任何请求都会 40302。
+    // 这是用户最容易误判为「代理坏了」的场景，doctor 必须明确报出来。
+    match crate::proxy::health(paths) {
+        Ok(st) if st.account_restricted => {
+            items.push((
+                "account_restriction".into(),
+                false,
+                format!(
+                    "state={} 解禁={} {}",
+                    st.account_state.unwrap_or_else(|| "RESTRICTED".into()),
+                    st.account_restricted_until
+                        .unwrap_or_else(|| "未知".into()),
+                    st.account_message.unwrap_or_default()
+                ),
+            ));
+        }
+        Ok(st) => items.push((
+            "account_restriction".into(),
+            true,
+            format!(
+                "state={}",
+                st.account_state.unwrap_or_else(|| "unknown".into())
+            ),
+        )),
+        Err(e) => items.push((
+            "account_restriction".into(),
+            true,
+            format!("代理未运行，无法查询（{e}）"),
+        )),
+    }
+
     // Python
     let py = crate::proxy::find_python();
     items.push((

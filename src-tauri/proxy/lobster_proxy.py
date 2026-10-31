@@ -26,6 +26,7 @@ LobsterAI 本地 API 稳定代理（fork 自 RaccoonPlus 的 raccoon_proxy.py �
 """
 
 import base64
+import datetime
 import json
 import os
 import re
@@ -48,7 +49,7 @@ USAGE_SCHEMA_VERSION = 2
 # 代理脚本版本：Rust 侧启动时用它判断磁盘上的脚本是否比正在运行的进程新。
 # 升级安装后旧进程仍在跑，必须能识别出来并重启，否则改再多次也不生效
 # （v0.3.3 实测：另一台机器升级后 CC-Switch 拿到的仍是旧的 5 个模型）。
-PROXY_SCRIPT_VERSION = "0.3.4"
+PROXY_SCRIPT_VERSION = "0.3.5"
 
 # 客户端在响应写完之前主动断开连接时会抛出的异常。
 # 注意三者是「兄弟」而非父子关系：ConnectionAbortedError 既不是
@@ -70,7 +71,19 @@ DEFAULT_CONFIG = {
     "max_tokens_cap": 100000,
     "request_timeout": 330,
     "log_requests": True,
-    "probe_recheck_seconds": 60,
+    # 按需探测的缓存有效期（秒）：仅在有真实请求时才可能触发探测。
+    "probe_recheck_seconds": 300,
+    # 后台探活线程间隔（秒）。0 = 关闭（默认）：
+    #   代理绝不主动探测活跃度，一切上游请求都由真实调用触发
+    #   （启动时的一次路由初始化除外）。旧版每 60s 发真实 chat 探活，
+    #   被上游判定为「非人类高频调用 + 第三方转发」，触发账号 TEMP_RESTRICTED。
+    "probe_refresh_seconds": 0,
+    # 探活方式：
+    #   "metadata"（默认）= TCP + GET /models，不消耗模型额度、不产生推理请求
+    #   "chat"          = 旧行为（真实 chat 请求），仅在排障时手动开启
+    "probe_mode": "metadata",
+    # 服务端模型目录拉取失败后的退避上限（秒），避免持续重试
+    "catalog_backoff_max_seconds": 3600,
     # 代理自身鉴权：空 = 不校验（仅监听 127.0.0.1）
     "api_key": "",
     "models": {},
@@ -385,9 +398,23 @@ def _server_model_catalog(data_dir, timeout=6):
             base + "/api/models/available",
             headers={"Authorization": "Bearer " + token,
                      "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8", "replace"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            raw = ""
+            try:
+                raw = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            # 403/40302 是账号级风控，必须记录并触发熔断——旧版只记一条
+            # 「HTTP Error 403」然后每分钟重试，整夜给风控送证据。
+            if ACCOUNT.note_text(raw, source="models/available(%s)" % e.code):
+                return None
+            raise
+        body = json.loads(raw)
         if not isinstance(body, dict) or body.get("code") != 0:
+            ACCOUNT.note_text(raw, source="models/available")
             return None
         entries = []
         for m in body.get("data") or []:
@@ -444,35 +471,318 @@ def _port_open(base_url, timeout=1.5):
         return False
 
 
-def _probe_upstream(base_url, api_key):
-    """TCP 通 + 最小 chat 请求可用 → 认定候选有效。
-    实测上游（lobsterai-model-compat）没有 /v1/models 端点（404），
-    真实端点只有 /v1/chat/completions（错 key 也会回 200+data 流），
-    所以探活改用「端口可达 + chat 端点存在」判定。"""
+# --------------------------------------------------------------------------
+# 账号风控状态（TEMP_RESTRICTED / 40302）
+# --------------------------------------------------------------------------
+#
+# 实测（2026-10-30）：LobsterAI 服务端会对「第三方反向代理/插件转接、
+# 共享账号额度」做风控，返回
+#   {"code":40302,"data":{"accountAccess":{
+#       "state":"TEMP_RESTRICTED","restrictedUntil":"2026-10-31T08:57:05Z", ...}}}
+# 旧版代理把这条错误当成普通业务错误，既继续每分钟打上游，又把 403 包装成
+# HTTP 200 透传，导致 CC-Switch 只能报「422 格式转换错误」，看不到真实原因。
+
+# 这些状态都表示账号当前不可用；restrictedUntil 之后需要重新确认
+_ACCOUNT_BLOCKED_STATES = ("TEMP_RESTRICTED", "RESTRICTED", "SUSPENDED", "BANNED")
+
+
+def _parse_restriction_until(value):
+    """把 restrictedUntil（ISO8601，可能带 Z/纳秒）转成 epoch 秒；失败返回 0。"""
+    if not value or not isinstance(value, str):
+        return 0.0
+    raw = value.strip()
+    # Python 3.8 的 fromisoformat 不接受 Z，也不接受 >6 位小数
+    raw = raw.replace("Z", "+00:00")
+    m = re.match(r"^(.*?\.\d{6})\d*(.*)$", raw)
+    if m:
+        raw = m.group(1) + m.group(2)
+    try:
+        return datetime.datetime.fromisoformat(raw).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _find_account_access(obj):
+    """在任意响应 JSON 里递归找 accountAccess 节点。"""
+    if isinstance(obj, dict):
+        node = obj.get("accountAccess")
+        if isinstance(node, dict) and node.get("state"):
+            return node
+        for value in obj.values():
+            found = _find_account_access(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_account_access(value)
+            if found:
+                return found
+    return None
+
+
+def parse_account_restriction(text):
+    """从 HTTP 响应体（JSON 或 SSE）里解析账号限制信息。
+
+    返回 dict 或 None：
+      {"state", "restricted_until", "message", "message_en", "code"}
+    不依赖 HTTP 状态码——上游有时 403，有时把错误塞进 200 的 SSE。
+    """
+    if not text or not isinstance(text, str):
+        return None
+    candidates = []
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        candidates.append(text)
+    # SSE：逐行收集 data: 负载
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            if payload and payload != "[DONE]":
+                candidates.append(payload)
+    for raw in candidates:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        node = _find_account_access(obj)
+        if not node:
+            continue
+        state = str(node.get("state") or "").upper()
+        if state not in _ACCOUNT_BLOCKED_STATES:
+            continue
+        return {
+            "state": state,
+            "restricted_until": _parse_restriction_until(node.get("restrictedUntil")),
+            "message": node.get("message") or obj.get("message") or "",
+            "message_en": node.get("messageEn") or "",
+            "code": obj.get("code"),
+        }
+    return None
+
+
+def _extract_error_message(text):
+    """从 JSON 或 SSE 里提取可读错误消息（不限于账号限制）。"""
+    if not text:
+        return ""
+    chunks = []
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        chunks.append(text)
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            if payload and payload != "[DONE]":
+                chunks.append(payload)
+    for raw in chunks:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        err = obj.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str):
+            return err
+        if obj.get("message"):
+            return str(obj["message"])
+    return ""
+
+
+class AccountGuard(object):
+    """账号级风控状态。一旦识别到限制，就停止一切上游请求直到解禁时间。
+
+    这是「止损」而不是「绕过」：限制期间继续请求只会在厂商侧积累
+    「异常使用」证据（官方文案明确写了可能导致永久停用）。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._restriction = None   # parse_account_restriction 的结果
+        self._seen_at = 0.0
+        self._announced = False
+
+    def note_text(self, text, source=""):
+        """从响应体识别限制；命中则记录并返回 True。"""
+        info = parse_account_restriction(text)
+        if not info:
+            return False
+        self.note(info, source=source)
+        return True
+
+    def note(self, info, source=""):
+        with self._lock:
+            prev = self._restriction
+            self._restriction = info
+            self._seen_at = time.time()
+            first = not self._announced
+            self._announced = True
+        if first or not prev or prev.get("state") != info.get("state"):
+            until = info.get("restricted_until") or 0
+            when = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+                    if until else "未知")
+            log("!! 账号被上游限制: state=%s 解禁=%s%s"
+                % (info.get("state"), when,
+                   (" (%s)" % source) if source else ""))
+            log("   限制期间代理不再请求上游，避免加重风控。")
+
+    def restricted(self):
+        """当前是否处于限制窗口内（解禁后自动恢复探测）。"""
+        with self._lock:
+            info = self._restriction
+        if not info:
+            return None
+        until = float(info.get("restricted_until") or 0)
+        if until and time.time() >= until:
+            # 解禁时间已到：清空，让下一次真实请求/探测重新判定
+            with self._lock:
+                self._restriction = None
+                self._announced = False
+            log("账号限制窗口已过，恢复上游探测（以真实响应为准）。")
+            return None
+        return info
+
+    def _current(self):
+        with self._lock:
+            return self._restriction
+
+    def snapshot(self):
+        """给 /health 与 doctor 用的只读快照（不含任何凭据）。
+
+        限制窗口已过但尚未被真实请求确认时，state 显示 UNKNOWN
+        （而不是误报 OK）。
+        """
+        info = self._current()
+        if not info:
+            return {"state": "OK", "restricted_until": None,
+                    "restricted_until_text": None, "message": "",
+                    "message_en": "", "code": None,
+                    "checked_at": self._seen_at or None}
+        until = float(info.get("restricted_until") or 0)
+        expired = bool(until) and time.time() >= until
+        return {
+            "state": ("UNKNOWN" if expired else info.get("state")),
+            "note": ("限制窗口已过，待下次请求确认" if expired else ""),
+            "restricted_until": until or None,
+            "restricted_until_text": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                                    time.localtime(until))
+                                      if until else None),
+            "message": info.get("message") or "",
+            "message_en": info.get("message_en") or "",
+            "code": info.get("code"),
+            "checked_at": self._seen_at or None,
+        }
+
+    def clear(self):
+        """真实请求成功后清除限制标记。"""
+        with self._lock:
+            if self._restriction:
+                self._restriction = None
+                self._announced = False
+
+
+ACCOUNT = AccountGuard()
+
+
+class AccountRestrictedError(RuntimeError):
+    """账号级限制：不重试、不重探测，直接回 403。"""
+
+    def __init__(self, info):
+        self.info = info or {}
+        RuntimeError.__init__(self, self.info.get("message") or "账号暂时无法使用相关服务")
+
+
+def _restricted_http_status(info):
+    """账号限制统一映射 403（上游语义），限流类走 429。"""
+    code = info.get("code") if info else None
+    if code in (429, "429"):
+        return 429
+    return 403
+
+
+def _error_payload(info, protocol="openai"):
+    """构造对客户端友好的错误体，保留厂商原始信息与解禁时间。
+
+    Anthropic 端点必须返回 `{"type":"error","error":{...}}`，
+    否则 Claude Code / CC-Switch 的 Anthropic 分支解析不到 message。
+    """
+    snap = ACCOUNT.snapshot() if info else {}
+    inner = {
+        "message": info.get("message") or "账号暂时无法使用相关服务",
+        "type": "account_restricted",
+        "code": info.get("code") or 40302,
+        "accountAccess": {
+            "state": snap.get("state") or (info.get("state") if info else None),
+            "restrictedUntil": (snap.get("restricted_until_text")
+                                or None),
+            "message": info.get("message") or "",
+            "messageEn": info.get("message_en") or "",
+        },
+    }
+    if protocol == "anthropic":
+        return {"type": "error", "error": inner}
+    return {"error": inner}
+
+
+def _probe_upstream(base_url, api_key, mode=None):
+    """探活：默认只做 TCP + GET，不消耗模型额度、不产生推理请求。
+
+    为什么不再用 chat 探活：旧版每 60s POST 一次真实 chat（即使没人用
+    代理），两天在客户端日志里留下约 1,300 次 2~4 事件的「非人类」调用，
+    与厂商「禁止第三方反向代理/插件转接」的风控规则叠加，直接触发
+    TEMP_RESTRICTED。metadata 模式拿任意 HTTP 响应即证明服务活着。
+
+    返回：
+      True  = 端点活着
+      None  = 端口不可达/连接失败
+      "restricted" = 明确识别到账号限制（调用方应停止探测）
+    """
     if not _port_open(base_url):
         return None
+    mode = mode or CONFIG.get("probe_mode") or "metadata"
     url = base_url.rstrip("/")
     if not url.endswith("/v1"):
         url = url + "/v1"
-    body = json.dumps({
-        "model": "deepseek-flash",
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "stream": False,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url + "/chat/completions",
-        data=body,
-        headers={"Authorization": "Bearer " + api_key,
-                 "Content-Type": "application/json"},
-        method="POST")
+    headers = {"Authorization": "Bearer " + api_key,
+               "Accept": "application/json"}
     try:
-        with urllib.request.urlopen(req, timeout=4) as _resp:
-            # 能拿到 HTTP 200 响应即认为端点活着（读首块即弃）
-            _resp.read(256)
+        if mode == "chat":
+            # 兼容排障：仅在 config.probe_mode="chat" 时使用
+            body = json.dumps({
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "stream": False,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                url + "/chat/completions", data=body,
+                headers=dict(headers, **{"Content-Type": "application/json"}),
+                method="POST")
+        else:
+            req = urllib.request.Request(url + "/models", headers=headers,
+                                         method="GET")
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            raw = resp.read(2048)
+            text = raw.decode("utf-8", "replace")
+            if ACCOUNT.note_text(text, source="probe"):
+                return "restricted"
             return True
-    except urllib.error.HTTPError:
-        # 4xx/5xx 也证明 chat 端点存在（服务活着、只是拒绝请求）
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read(4096).decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        if ACCOUNT.note_text(raw, source="probe(%s)" % e.code):
+            return "restricted"
+        if e.code in (401,):
+            # 端点活着但 key 过期：不阻断探测（下次轮换会换 key）
+            return True
+        # 404/405/400 等同样证明服务在跑，只是没有该路由
         return True
     except Exception:
         return None
@@ -498,12 +808,15 @@ class UpstreamManager(object):
         self._server_at = 0.0
         self._server_lock = threading.Lock()
         self._server_refreshing = False
+        # 目录拉取失败退避：旧版失败后每分钟重试，账号受限时整夜积累 403
+        self._catalog_backoff = 0
+        self._catalog_retry_at = 0.0
 
     def probe(self, force=False):
         with self._lock:
             now = time.time()
             if (not force and self._cached
-                    and now - self._cached[3] < int(self.cfg.get("probe_recheck_seconds", 60))):
+                    and now - self._cached[3] < int(self.cfg.get("probe_recheck_seconds", 300))):
                 return self._cached[:3]
         # 双重检查：等锁期间别的线程可能已经探测完
         with self._probe_lock:
@@ -511,16 +824,28 @@ class UpstreamManager(object):
                 now = time.time()
                 if (not force and self._cached
                         and now - self._cached[3]
-                        < int(self.cfg.get("probe_recheck_seconds", 60))):
+                        < int(self.cfg.get("probe_recheck_seconds", 300))):
                     return self._cached[:3]
             cands = _collect_candidates(self.data_dir)
             if not cands:
                 with self._lock:
                     self._cached = None
                 return None
+            # 账号处于限制窗口内：不发任何上游请求，直接返回 None。
+            # 这不是「探测失败」，调用方据此快速失败，不再触发重试/重探测。
+            if ACCOUNT.restricted():
+                with self._lock:
+                    self._cached = None
+                return None
             base, key, model = None, None, None
             for cb, ck, cm in cands:
-                if _probe_upstream(cb, ck):
+                verdict = _probe_upstream(cb, ck)
+                if verdict == "restricted":
+                    # 明确受限：停止该轮所有候选探测（同一账号，换端口无意义）
+                    with self._lock:
+                        self._cached = None
+                    return None
+                if verdict is True:
                     base, key, model = cb, ck, cm
                     break
             if base is None:
@@ -546,11 +871,15 @@ class UpstreamManager(object):
 
     def _refresh_server_catalog(self):
         try:
+            if ACCOUNT.restricted():
+                return
             entries = _server_model_catalog(self.data_dir)
             if entries:
                 with self._server_lock:
                     self._server_catalog = entries
                     self._server_at = time.time()
+                    self._catalog_backoff = 0
+                    self._catalog_retry_at = 0.0
                 # 立即用新目录重建模型缓存，而不是只置 None 等懒加载：
                 # /health 走 peek() 只读缓存，置 None 会让它在下次
                 # /v1/models 之前一直返回空/仅 config 的残缺清单。
@@ -564,11 +893,22 @@ class UpstreamManager(object):
                         self._models_cache = rebuilt
                         self._models_at = time.time()
                 log("服务端模型目录: %d 个模型" % len(entries))
+            else:
+                self._schedule_catalog_retry()
         except Exception as e:
             log("警告: 服务端模型目录刷新失败 (%s)" % e)
+            self._schedule_catalog_retry()
         finally:
             with self._server_lock:
                 self._server_refreshing = False
+
+    def _schedule_catalog_retry(self):
+        """失败后指数退避，最长 catalog_backoff_max_seconds。"""
+        base = max(60, int(CONFIG.get("probe_recheck_seconds", 300)))
+        cap = max(base, int(CONFIG.get("catalog_backoff_max_seconds", 3600)))
+        with self._server_lock:
+            self._catalog_backoff = min(cap, max(base, self._catalog_backoff * 2))
+            self._catalog_retry_at = time.time() + self._catalog_backoff
 
     def server_catalog(self, timeout=0, force=False):
         """取服务端目录。
@@ -579,9 +919,15 @@ class UpstreamManager(object):
         """
         with self._server_lock:
             current = self._server_catalog
-            fresh = (current is not None
-                     and time.time() - self._server_at < 600)
+            now = time.time()
+            fresh = (current is not None and now - self._server_at < 600)
             if fresh and not force:
+                return current
+            # 失败退避窗口内直接返回旧值，不再打上游（timeout<=0 是请求路径，
+            # 更不应该在退避期内反复排队刷新）
+            if now < self._catalog_retry_at:
+                return current
+            if ACCOUNT.restricted():
                 return current
             already = self._server_refreshing
             if timeout <= 0:
@@ -634,7 +980,9 @@ class UpstreamManager(object):
                 base.rstrip("/") + "/models",
                 headers={"Authorization": "Bearer " + key})
             with urllib.request.urlopen(req, timeout=4) as resp:
-                upstream = json.loads(resp.read().decode("utf-8", "replace"))
+                raw = resp.read().decode("utf-8", "replace")
+                ACCOUNT.note_text(raw, source="upstream /models")
+                upstream = json.loads(raw)
         except Exception:
             upstream = None
         if isinstance(upstream, dict) and (upstream.get("data") or upstream.get("models")):
@@ -673,6 +1021,8 @@ class UpstreamManager(object):
 
     def models(self):
         """上游模型列表（缓存 60s）。LobsterAI 不在运行时返回 None。"""
+        if ACCOUNT.restricted():
+            return None
         found = self.probe()
         if not found:
             return None
@@ -701,14 +1051,16 @@ class UpstreamManager(object):
         给 /health 用：健康检查必须是毫秒级返回。若走 probe()，
         上游不在时会依次做 TCP 探活（1.5s/候选）+ 最小 chat 请求（4s），
         远超 GUI 端 1.5s 的健康检查超时——GUI 判定代理挂了并关闭连接，
-        代理这边就报 WinError 10053。返回 (base, alive, models) 或 None。
+        代理这边就报 WinError 10053。返回 (base, models, checked_at) 或
+        None；checked_at 供调用方判断缓存新鲜度（后台探活默认关闭）。
         """
         with self._lock:
             if not self._cached:
                 return None
             base = self._cached[0]
             m = self._models_cache
-        return base, m
+            checked_at = self._cached[3]
+        return base, m, checked_at
 
     def upstream_model_ids(self):
         m = self.models()
@@ -1096,8 +1448,17 @@ def openai_to_anthropic_response(oa, model_id):
 
 def call_upstream(payload, force_probe=False):
     """调用上游 chat/completions，返回 HTTPResponse（流式需自行读取并关闭）。"""
+    # 账号受限期间不发任何上游请求：直接抛出专用异常，
+    # 调用方回 403 而不是反复重试/重探测。
+    info = ACCOUNT.restricted()
+    if info:
+        raise AccountRestrictedError(info)
     found = UPSTREAM.probe(force=force_probe)
     if not found:
+        # 探测为 None 有两种可能：真不可用 / 刚被限制
+        info = ACCOUNT.restricted()
+        if info:
+            raise AccountRestrictedError(info)
         raise RuntimeError("LobsterAI 本地服务不可用（客户端未运行或端口未探测到）")
     base, key, _model = found
     url = base.rstrip("/") + "/chat/completions"
@@ -1108,16 +1469,29 @@ def call_upstream(payload, force_probe=False):
         "Accept": "text/event-stream" if payload.get("stream") else "application/json",
     }
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    return urllib.request.urlopen(req, timeout=CONFIG["request_timeout"])
+    try:
+        return urllib.request.urlopen(req, timeout=CONFIG["request_timeout"])
+    except urllib.error.HTTPError as e:
+        # 上游有时用 HTTP 403 + JSON 报账号限制；这里读一次正文并挂在异常上，
+        # 避免调用方读到空 body（HTTPError 只能读一次）。
+        try:
+            raw = e.read().decode("utf-8", "replace")
+            e.lobster_body = raw
+            ACCOUNT.note_text(raw, source="chat(%s)" % e.code)
+        except Exception:
+            pass
+        raise
 
 
 def upstream_error_text(exc):
     if isinstance(exc, urllib.error.HTTPError):
-        try:
-            raw = exc.read().decode("utf-8", "replace")
-        except Exception:
-            raw = ""
-        return exc.code, raw
+        body = getattr(exc, "lobster_body", None)
+        if body is None:
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+        return exc.code, body
     return None, str(exc)
 
 
@@ -1137,6 +1511,18 @@ def iter_sse_lines(resp):
             yield line.decode("utf-8", "replace").rstrip("\r")
     if buf:
         yield buf.decode("utf-8", "replace").rstrip("\r")
+
+
+def iter_sse_lines_with_prefix(prefix_text, resp):
+    """先吐出已读到的前缀文本行，再继续读 resp（流式前 peek 用）。"""
+    buf = prefix_text
+    while "\n" in buf:
+        line, buf = buf.split("\n", 1)
+        yield line.rstrip("\r")
+    for line in iter_sse_lines(resp):
+        yield line
+    if buf:
+        yield buf
 
 
 # --------------------------------------------------------------------------
@@ -1429,18 +1815,32 @@ class Handler(BaseHTTPRequestHandler):
             # 客户端先断 → ConnectionAbortedError 刷屏。缓存由启动探测
             # 与后台刷新线程维护（见 start_probe_refresher）。
             snap = UPSTREAM.peek()
-            base, models_cache = (snap if snap else (None, None))
+            base, models_cache, checked_at = (snap if snap else (None, None, None))
+            account = ACCOUNT.snapshot()
+            restricted = account.get("state") in _ACCOUNT_BLOCKED_STATES
             self._send_json(200, {
                 "status": "ok",
                 "upstream": base,
-                "upstream_alive": bool(base),
+                # 账号受限时上游即使端口活也不能用，统一报不可用，
+                # 避免 GUI/CC-Switch 看到「绿色」继续发请求。
+                "upstream_alive": bool(base) and not restricted,
                 "default_model": CONFIG["default_model"],
                 "models": _models_from_cache(models_cache),
+                # 账号风控状态（无凭据）：state / restricted_until / message
+                "account": account,
+                "account_restricted": restricted,
+                # 最近一次探测时间（后台探活默认关闭，供判断缓存新鲜度）
+                "probe_checked_at": checked_at,
+                "probe_mode": CONFIG.get("probe_mode") or "metadata",
                 # Rust 侧靠它判断正在运行的进程是否还是旧脚本（升级后自动重启）
                 "script_version": PROXY_SCRIPT_VERSION,
             })
             return
         if path in ("/models",):
+            if ACCOUNT.restricted():
+                info = ACCOUNT.restricted()
+                self._send_json(_restricted_http_status(info), _error_payload(info))
+                return
             m = UPSTREAM.models()
             if m is None:
                 self._send_json(503, {"error": {
@@ -1500,11 +1900,22 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("model"), client_stream, len(body.get("messages") or [])))
         try:
             resp = self._upstream_with_retry(body)
+        except AccountRestrictedError as e:
+            _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
+            self._send_json(_restricted_http_status(e.info), _error_payload(e.info))
+            return
         except urllib.error.HTTPError as e:
             status, text = upstream_error_text(e)
             _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
-            self._send_json(status or 502, {"error": {"message": "上游错误(%s): %s" % (status, str(text)[:500]),
-                                                      "type": "api_error"}})
+            info = parse_account_restriction(text)
+            if info:
+                ACCOUNT.note(info, source="openai")
+                self._send_json(_restricted_http_status(info), _error_payload(info))
+                return
+            self._send_json(status or 502, {"error": {
+                "message": "上游错误(%s): %s" % (status, _extract_error_message(text)
+                                                 or str(text)[:500]),
+                "type": "api_error"}})
             return
         except Exception as e:
             _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
@@ -1517,17 +1928,49 @@ class Handler(BaseHTTPRequestHandler):
             self._pipe_flat(resp, model_id, est_in)
 
     def _upstream_with_retry(self, payload):
-        """调上游；连接类失败（端口轮换）强制重探测一次再试。"""
+        """调上游；连接类失败（端口轮换）强制重探测一次再试。
+
+        账号受限不重试：重试只会继续触发风控，而且受限是账号级状态，
+        换端口/重探测都不会改变结果。
+        """
         try:
             return call_upstream(payload)
-        except urllib.error.HTTPError:
+        except (urllib.error.HTTPError, AccountRestrictedError):
             raise
         except Exception as e:
+            if ACCOUNT.restricted():
+                raise AccountRestrictedError(ACCOUNT.restricted())
             log("上游调用失败(%s)，重探测后重试一次" % e)
             return call_upstream(payload, force_probe=True)
 
     def _pipe_stream(self, resp, model_id, est_in):
-        """把上游 SSE 原样转发（chunked），旁路解析 usage 后记账。"""
+        """把上游 SSE 原样转发（chunked），旁路解析 usage 后记账。
+
+        v0.3.5：发送 200 响应头之前先 peek 首个 SSE 事件。上游经常用
+        `event: error` + 40302/TEMP_RESTRICTED 表达账号限制；这类响应
+        绝不能以 200 流形式下发，否则调用方只会看到「流里冒出一个错误」。
+        """
+        try:
+            first_block = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+        except Exception:
+            first_block = b""
+        first_text = first_block.decode("utf-8", "replace")
+        if first_text.strip():
+            # 首块即错误（JSON 或 SSE error 事件）：回真实状态码，不开始流
+            if (parse_account_restriction(first_text)
+                    or first_text.lstrip().startswith("{")):
+                rest = b""
+                try:
+                    rest = resp.read()
+                except Exception:
+                    pass
+                full = first_text + rest.decode("utf-8", "replace")
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                if self._pipe_upstream_error_text(full, model_id, est_in, "openai"):
+                    return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1541,11 +1984,14 @@ class Handler(BaseHTTPRequestHandler):
         normal_end = False
         sse_buf = ""
         try:
+            block = first_block
             while True:
-                block = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+                if not block:
+                    block = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
                 if not block:
                     break
                 text = block.decode("utf-8", "replace")
+                block = b""
                 sse_buf += text
                 lines = sse_buf.split("\n")
                 sse_buf = lines.pop()
@@ -1610,7 +2056,13 @@ class Handler(BaseHTTPRequestHandler):
     def _pipe_flat(self, resp, model_id, est_in):
         """非流式转发。实测上游（lobsterai-model-compat）对 stream:false 也
         强制返回 SSE 流（content-type: text/event-stream），所以这里统一按
-        SSE 读入并聚合成标准 OpenAI 非流式响应。"""
+        SSE 读入并聚合成标准 OpenAI 非流式响应。
+
+        v0.3.5 修复：上游错误（event: error / 40302 / 纯错误 JSON）以前会被
+        当作「未聚合成功的 SSE」原样以 **200 + application/json** 回给客户端，
+        CC-Switch 收到后只能报「422 格式转换错误」，用户看不到真实原因。
+        现在先判错并回正确状态码，成功才聚合。
+        """
         try:
             data = resp.read()
         finally:
@@ -1624,7 +2076,8 @@ class Handler(BaseHTTPRequestHandler):
             ctype = (resp.headers.get("Content-Type") or "").lower()
         except Exception:
             pass
-        if "text/event-stream" in ctype or text.lstrip().startswith("data:"):
+        is_sse = "text/event-stream" in ctype or text.lstrip().startswith("data:")
+        if is_sse:
             oa = self._aggregate_sse(text)
             if oa is not None:
                 business_error = self._openai_business_error(oa)
@@ -1644,7 +2097,20 @@ class Handler(BaseHTTPRequestHandler):
                 except CLIENT_GONE_ERRORS:
                     pass
                 return
-        # 真非流式（未来上游修复后）：解析统计后原样转发
+            # 聚合失败：如果正文是上游错误（账号限制/限流/普通错误），
+            # 按真实语义回错，绝不再包成 200。
+            if self._pipe_upstream_error_text(text, model_id, est_in, "openai"):
+                return
+            _safe_record_usage("openai", model_id, False, est_in, 0, "estimated")
+            self._send_json(502, {"error": {
+                "message": "上游返回空流或无法解析的 SSE",
+                "type": "api_error",
+                "upstream_body_kind": "sse",
+                "upstream_body_bytes": len(data)}})
+            return
+        # 真非流式（未来上游修复后）：先看是不是错误体，再解析统计并转发
+        if self._pipe_upstream_error_text(text, model_id, est_in, "openai"):
+            return
         try:
             oa = json.loads(text)
             usage = oa.get("usage") or {}
@@ -1663,6 +2129,39 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except CLIENT_GONE_ERRORS:
             pass
+
+    def _pipe_upstream_error_text(self, text, model_id, est_in, protocol):
+        """识别上游错误正文并回对应 HTTP 状态；命中返回 True。
+
+        顺序很重要：账号限制（40302）→ 取错误消息 → 其余错误形态。
+        """
+        info = parse_account_restriction(text)
+        if info:
+            ACCOUNT.note(info, source=protocol)
+            _safe_record_usage(protocol, model_id, False, est_in, 0, "estimated")
+            self._send_json(_restricted_http_status(info),
+                            _error_payload(info, protocol=protocol))
+            return True
+        message = _extract_error_message(text)
+        if not message:
+            return False
+        lowered = message.lower()
+        status = 502
+        for needle, code in (
+                ("rate limit", 429), ("too many requests", 429),
+                ("quota", 429), ("限流", 429), ("频率", 429),
+                ("insufficient", 402), ("余额", 402), ("积分", 402),
+                ("unauthorized", 401), ("invalid api key", 401),
+                ("forbidden", 403), ("无权限", 403), ("禁止", 403),
+        ):
+            if needle in lowered:
+                status = code
+                break
+        _safe_record_usage(protocol, model_id, False, est_in, 0, "estimated")
+        self._send_json(status, {"error": {
+            "message": message, "type": "upstream_error",
+            "upstream_status": status}})
+        return True
 
     @staticmethod
     def _aggregate_sse(text):
@@ -1770,12 +2269,24 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             resp = self._upstream_with_retry(payload)
+        except AccountRestrictedError as e:
+            _safe_record_usage("anthropic", model_id, False, est_in, 0, "estimated")
+            self._send_json(_restricted_http_status(e.info),
+                            _error_payload(e.info, protocol="anthropic"))
+            return
         except urllib.error.HTTPError as e:
             status, text = upstream_error_text(e)
             _safe_record_usage("anthropic", model_id, False, est_in, 0, "estimated")
+            info = parse_account_restriction(text)
+            if info:
+                ACCOUNT.note(info, source="anthropic")
+                self._send_json(_restricted_http_status(info),
+                                _error_payload(info, protocol="anthropic"))
+                return
             self._send_error_anthropic(
                 status or 502, "api_error",
-                "上游返回错误(%s): %s" % (status, text[:500]))
+                "上游返回错误(%s): %s" % (status,
+                                          _extract_error_message(text) or text[:500]))
             return
         except Exception as e:
             _safe_record_usage("anthropic", model_id, False, est_in, 0, "estimated")
@@ -1802,12 +2313,16 @@ class Handler(BaseHTTPRequestHandler):
             # 上游强制 SSE：聚合成完整对象
             oa = self._aggregate_sse(text)
             if oa is None:
+                if self._pipe_upstream_error_text(text, model_id, est_in, "anthropic"):
+                    return
                 _safe_record_usage("anthropic", model_id, False, est_in, 0,
                                    "estimated")
                 self._send_error_anthropic(502, "api_error",
                                            "上游返回空流: %s" % text[:200])
                 return
         else:
+            if self._pipe_upstream_error_text(text, model_id, est_in, "anthropic"):
+                return
             try:
                 oa = json.loads(text)
             except Exception:
@@ -1829,6 +2344,39 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, converted)
 
     def _stream_response(self, resp, model_id, est_in):
+        # 发送 200 之前先 peek 首块：账号限制/上游错误必须回真实状态码，
+        # 否则客户端只会在流中间看到一个 error 事件（旧版症状）。
+        try:
+            first_block = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+        except Exception:
+            first_block = b""
+        first_text = first_block.decode("utf-8", "replace")
+        if first_text.strip() and (parse_account_restriction(first_text)
+                                   or first_text.lstrip().startswith("{")):
+            rest = b""
+            try:
+                rest = resp.read()
+            except Exception:
+                pass
+            full = first_text + rest.decode("utf-8", "replace")
+            try:
+                resp.close()
+            except Exception:
+                pass
+            info = parse_account_restriction(full)
+            if info:
+                ACCOUNT.note(info, source="anthropic-stream")
+                _safe_record_usage("anthropic", model_id, False, est_in, 0,
+                                   "estimated")
+                self._send_json(_restricted_http_status(info),
+                                _error_payload(info, protocol="anthropic"))
+                return
+            message = _extract_error_message(full)
+            if message:
+                _safe_record_usage("anthropic", model_id, False, est_in, 0,
+                                   "estimated")
+                self._send_error_anthropic(502, "api_error", message)
+                return
         emitter = AnthropicStreamEmitter(
             model_id, input_tokens_estimate=est_in,
             emit_thinking=bool(CONFIG.get("emit_thinking")))
@@ -1837,7 +2385,7 @@ class Handler(BaseHTTPRequestHandler):
         valid_response = False
         normal_end = False
         try:
-            for line in iter_sse_lines(resp):
+            for line in iter_sse_lines_with_prefix(first_text, resp):
                 if not line or line.startswith(":"):
                     continue
                 if not line.startswith("data:"):
@@ -2166,14 +2714,151 @@ def resilience_selftest():
         return 1
 
 
+def account_guard_selftest():
+    """离线自检：账号限制识别 / 熔断 / 错误透传语义。
+
+    回归 2026-10-30 事故：
+    - 上游返回 `event: error` + 40302 TEMP_RESTRICTED；
+    - 旧版 `_aggregate_sse()` 返回 None 后把原始 SSE 以 200 透传；
+    - CC-Switch 聚合成「422 格式转换错误」，用户看不到真实原因；
+    - 同时后台每分钟继续请求上游，整夜积累 403。
+    """
+    log("=== 账号风控自检 ===")
+    try:
+        sse_restricted = (
+            'event: error\n'
+            'data: {"type":"error","error":{"message":"账号暂时无法使用相关服务",'
+            '"code":40302,"type":"proxy_error","accountAccess":{'
+            '"state":"TEMP_RESTRICTED","restrictedUntil":"2026-10-31T08:57:05.162Z",'
+            '"message":"账号暂时无法使用相关服务","messageEn":"Your account is temporarily restricted"}}}\n\n')
+        json_restricted = json.dumps({
+            "code": 40302,
+            "message": "账号暂时无法使用相关服务",
+            "data": {"accountAccess": {
+                "state": "TEMP_RESTRICTED",
+                "restrictedUntil": "2026-10-31T08:57:05.162Z",
+                "message": "账号暂时无法使用相关服务",
+            }}}, ensure_ascii=False)
+
+        # 1) JSON 与 SSE 两种载体都必须能解析
+        for label, text in (("sse", sse_restricted), ("json", json_restricted)):
+            info = parse_account_restriction(text)
+            if not info:
+                raise AssertionError("%s 限制信息未被识别" % label)
+            if info["state"] != "TEMP_RESTRICTED":
+                raise AssertionError("%s state 错误：%r" % (label, info["state"]))
+            if not info["restricted_until"]:
+                raise AssertionError("%s 解禁时间未解析：%r" % (label, info))
+            if not info["message"]:
+                raise AssertionError("%s 缺少消息" % label)
+
+        # 2) 正常响应不能被误判
+        normal = ('data: {"choices":[{"index":0,"delta":{"content":"hi"},'
+                  '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        if parse_account_restriction(normal):
+            raise AssertionError("正常 SSE 被误判为限制")
+        if parse_account_restriction('{"code":0,"data":[]}'):
+            raise AssertionError("正常 JSON 被误判为限制")
+
+        # 3) 纳秒精度 / 时区必须能解析（上游给的是 .162Z 与 9 位秒）
+        until = _parse_restriction_until("2026-10-31T08:57:05.162123456Z")
+        expect = datetime.datetime(2026, 10, 31, 8, 57, 5, 162123,
+                                   tzinfo=datetime.timezone.utc).timestamp()
+        if abs(until - expect) > 0.01:
+            raise AssertionError("解禁时间解析错误：%r vs %r" % (until, expect))
+
+        # 4) 熔断：note 之后 restricted() 必须立刻返回信息；
+        #    call_upstream 必须直接抛 AccountRestrictedError（不发网络请求）
+        guard_bak = (ACCOUNT._restriction, ACCOUNT._seen_at, ACCOUNT._announced)
+        cached_bak = UPSTREAM._cached
+        calls = {"n": 0}
+        orig_port_open = globals()["_port_open"]
+
+        def trap(*_a, **_kw):
+            calls["n"] += 1
+            raise AssertionError("受限期间不应发起网络请求")
+
+        try:
+            ACCOUNT._restriction = None
+            ACCOUNT._seen_at = 0.0
+            ACCOUNT._announced = False
+            ACCOUNT._restriction = {
+                "state": "TEMP_RESTRICTED",
+                "restricted_until": time.time() + 3600,
+                "message": "账号暂时无法使用相关服务",
+                "message_en": "",
+                "code": 40302,
+            }
+            if not ACCOUNT.restricted():
+                raise AssertionError("restricted() 未返回限制信息")
+            globals()["_port_open"] = trap
+            try:
+                call_upstream({"messages": []})
+                raise AssertionError("受限期间 call_upstream 未抛错")
+            except AccountRestrictedError:
+                pass
+            except AssertionError:
+                raise
+            except Exception as e:
+                raise AssertionError("受限期间应抛 AccountRestrictedError，实际 %r" % e)
+            if calls["n"]:
+                raise AssertionError("受限期间仍发起了 %d 次网络请求" % calls["n"])
+        finally:
+            globals()["_port_open"] = orig_port_open
+            ACCOUNT._restriction, ACCOUNT._seen_at, ACCOUNT._announced = guard_bak
+            UPSTREAM._cached = cached_bak
+
+        # 5) 过期限制应自动解除（不需要重启）
+        ACCOUNT._restriction = {
+            "state": "TEMP_RESTRICTED",
+            "restricted_until": time.time() - 1,
+            "message": "x", "message_en": "", "code": 40302,
+        }
+        ACCOUNT._announced = True
+        try:
+            if ACCOUNT.restricted() is not None:
+                raise AssertionError("过期限制未自动解除")
+        finally:
+            ACCOUNT._restriction, ACCOUNT._seen_at, ACCOUNT._announced = guard_bak
+
+        # 6) 错误消息提取（普通上游错误也要可读）
+        msg = _extract_error_message('data: {"error":{"message":"rate limit exceeded"}}\n\n')
+        if msg != "rate limit exceeded":
+            raise AssertionError("错误消息提取失败：%r" % (msg,))
+
+        # 7) 上游错误状态码映射：账号限制 403，限流消息 429/402
+        payload = _error_payload({
+            "state": "TEMP_RESTRICTED", "message": "m", "message_en": "",
+            "code": 40302, "restricted_until": time.time() + 60})
+        if payload["error"]["type"] != "account_restricted":
+            raise AssertionError("错误体类型错误：%r" % (payload,))
+        if _restricted_http_status({"code": 40302}) != 403:
+            raise AssertionError("账号限制应映射 403")
+
+        log("账号风控自检通过（SSE/JSON 识别/熔断零请求/过期解禁/错误消息）")
+        return 0
+    except Exception as e:
+        log("账号风控自检失败: %s" % e)
+        return 1
+
+
 def selftest():
     log("=== 自检 ===")
     if usage_storage_selftest():
         return 1
     if resilience_selftest():
         return 1
+    if account_guard_selftest():
+        return 1
     found = UPSTREAM.probe(force=True)
     if not found:
+        info = ACCOUNT.restricted()
+        if info:
+            log("账号被上游限制：%s，解禁 %s"
+                % (info.get("state"),
+                   time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(info.get("restricted_until") or 0))))
+            return 1
         log("上游不可用：LobsterAI 未运行或本地端口探测失败")
         return 1
     base, key, model = found
@@ -2192,6 +2877,9 @@ def selftest():
         resp.close()
         ans = ((oa.get("choices") or [{}])[0].get("message") or {}).get("content")
         log("真实调用成功 (model=%s): %s" % (mid, ans))
+    except AccountRestrictedError as e:
+        log("真实调用被账号限制拦截：%s" % e)
+        return 1
     except Exception as e:
         st, tx = upstream_error_text(e)
         log("真实调用失败 (%s): %s" % (st, tx[:300]))
@@ -2205,24 +2893,48 @@ def selftest():
 # --------------------------------------------------------------------------
 
 def start_probe_refresher():
-    """后台定期刷新上游探测缓存，让 /health 永远只读缓存、毫秒级返回。
+    """后台探活线程。默认**关闭**（probe_refresh_seconds=0）——只在显式配置
+    了正数间隔时启动，供排障/特殊场景使用。
 
-    间隔取 probe_recheck_seconds（默认 60s）。探测失败不退出线程：
-    用户可能稍后才启动 LobsterAI，下次循环会再试。
+    为什么默认关闭：任何周期性上游请求都是「非人类」流量指纹。v0.3.4 及
+    以前每 60s 发一次真实 chat 探活（约 1,300 次/两天），叠加第三方转发
+    本身，直接触发账号 TEMP_RESTRICTED。路由发现完全够用按需探测：
+    - 首个请求到达时 probe() 一次（metadata GET，不耗额度）；
+    - 请求连接失败时 force 重探测一次（`_upstream_with_retry`）；
+    - 缓存有效期 probe_recheck_seconds，过期后由下一个请求顺带刷新。
     """
-    interval = max(5, int(CONFIG.get("probe_recheck_seconds", 60)))
+    interval = max(30, int(CONFIG.get("probe_refresh_seconds", 0) or 0))
+    backoff_max = max(interval, int(CONFIG.get("catalog_backoff_max_seconds", 3600)))
 
     def loop():
+        backoff = interval
         while True:
+            sleep_for = interval
             try:
-                found = UPSTREAM.probe(force=True)
-                if found:
-                    log("上游探测刷新: %s" % found[0])
-                    # 服务端模型目录走 HTTPS，必须在 _lock 之外补
-                    UPSTREAM.server_catalog(timeout=8)
+                restricted = ACCOUNT.restricted()
+                if restricted:
+                    until = float(restricted.get("restricted_until") or 0)
+                    sleep_for = max(interval, min(backoff_max,
+                                                  until - time.time() + 5)) if until else backoff
+                    backoff = min(backoff_max, max(interval, backoff * 2))
+                else:
+                    found = UPSTREAM.probe(force=True)
+                    if found:
+                        log("上游探测刷新: %s" % found[0])
+                        backoff = interval
+                        # 服务端模型目录走 HTTPS，必须在 _lock 之外补
+                        UPSTREAM.server_catalog(timeout=8)
+                    else:
+                        # 失败也要退避：客户端可能根本不在运行/仍未解禁
+                        restricted = ACCOUNT.restricted()
+                        if not restricted:
+                            sleep_for = backoff
+                            backoff = min(backoff_max, max(interval, backoff * 2))
             except Exception as e:
                 log("上游探测刷新失败: %s" % e)
-            time.sleep(interval)
+                sleep_for = backoff
+                backoff = min(backoff_max, max(interval, backoff * 2))
+            time.sleep(max(5, sleep_for))
 
     t = threading.Thread(target=loop, name="upstream-probe-refresher")
     t.daemon = True
@@ -2235,7 +2947,8 @@ def main():
         try:
             success = (usage_storage_selftest() == 0
                        and resilience_selftest() == 0
-                       and model_catalog_selftest() == 0)
+                       and model_catalog_selftest() == 0
+                       and account_guard_selftest() == 0)
         except BaseException as e:
             log("存储/容错自检失败（未处理异常）: %s" % e)
             success = False
@@ -2257,6 +2970,13 @@ def main():
         log("上游就绪: %s" % found[0])
         # 服务端目录要在首次 /v1/models 之前就绪；它在锁外，最多 8s
         UPSTREAM.server_catalog(timeout=8)
+    elif ACCOUNT.restricted():
+        info = ACCOUNT.restricted()
+        log("警告: 账号被上游限制（%s），解禁前不会发出任何上游请求" % info.get("state"))
+        log("       预计解禁: %s" % (time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(info.get("restricted_until") or 0))
+            if info.get("restricted_until") else "未知"))
     else:
         log("警告: 上游暂不可用（LobsterAI 未运行？），代理仍将启动并按需重探测")
 
@@ -2268,7 +2988,10 @@ def main():
         sys.exit(1)
 
     httpd.daemon_threads = True
-    start_probe_refresher()
+    # 后台探活默认关闭（probe_refresh_seconds=0）：代理不主动探测活跃度，
+    # 上游请求全部由真实调用触发。需要周期性探活时显式配置正数间隔。
+    if int(CONFIG.get("probe_refresh_seconds", 0) or 0) > 0:
+        start_probe_refresher()
     log("LobsterPlus 稳定代理已启动: http://%s:%d" % (host, port))
     log("  OpenAI   : http://%s:%d/v1/chat/completions" % (host, port))
     log("  Anthropic: http://%s:%d/v1/messages" % (host, port))

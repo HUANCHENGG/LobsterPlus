@@ -115,8 +115,16 @@ token 策略：
 
 **稳定器**（UpstreamManager，替换 raccoon 的 AuthManager）：
 - 候选 = models.json 与 openclaw.json 两处 `(baseUrl, apiKey)`；
-- 探活 = TCP 可连 + 最小 `POST /v1/chat/completions` 确认端点存在（上游无 `/v1/models`，HTTP 错误响应也表示服务在线）；
-- 缓存 60s；连接失败自动 force 重探测并重试一次；全挂返回 503（LobsterAI 未运行）。
+- 探活 = TCP 可连 + `GET /v1/models`（`probe_mode=metadata`，**不发真实 chat**；`chat` 模式仅排障用）。上游无 `/v1/models`（404），任何 HTTP 响应都表示服务在线；
+- 缓存 300s（`probe_recheck_seconds`）；连接失败自动 force 重探测并重试一次；全挂返回 503（LobsterAI 未运行）；
+- **后台探活默认关闭**（`probe_refresh_seconds=0`）：代理不主动探测活跃度，一切上游请求由真实调用触发（缓存 TTL `probe_recheck_seconds`=300s，过期由下一个请求顺带刷新；连接失败由 `_upstream_with_retry` force 重探测）。显式配置正数间隔才启动后台线程，失败时指数退避（上限 `catalog_backoff_max_seconds`）。
+
+**账号风控熔断（`AccountGuard`，v0.3.5）**：上游对「第三方反向代理/插件转接」返回 `40302` + `accountAccess.state=TEMP_RESTRICTED` + `restrictedUntil`（HTTP JSON 或 200 的 SSE `event: error` 两种载体）。代理识别后：
+- 立即置全局受限标志，`call_upstream()` 直接抛 `AccountRestrictedError`（不重试、不重探测）；
+- 后台线程睡到 `restrictedUntil`（过期自动解除，不需重启）；
+- 所有端点按真实语义回错误：`/v1/chat/completions` 用 OpenAI 错误体、`/v1/messages` 用 `{"type":"error","error":...}`，状态码 403（限流 429 / 余额 402 / 其他 502）；
+- `/health` 暴露 `account.state` / `account_restricted` / `restricted_until_text`，`account_restricted` 时 `upstream_alive` 强制为 false；
+- `doctor` 增加 `account_restriction` 检查项，GUI 代理卡片显示红色提示与解禁时间。
 
 **模型目录**：上游 `/v1/models` 实测 404，清单有三个来源，按优先级：
 
@@ -142,7 +150,7 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 | GET /v1/models | OpenAI | 服务端权威目录 + 本地 openclaw 配置 + config 真实 ID（`claude-*` 别名不出现） |
 | POST /v1/messages | Anthropic | → OpenAI 转换（fork raccoon 转换层：system/messages/tools/tool_result 互转 + SSE 事件发射器 + thinking） |
 | POST /v1/messages/count_tokens | Anthropic | 估算 |
-| GET /health | — | 状态 + 上游探测结果 + `script_version` + models 名列表（**只读内存缓存**，绝不发起网络探测；缓存由启动探测与后台刷新线程维护，保证 GUI 1.5s 超时内返回） |
+| GET /health | — | 状态 + 上游探测结果 + `script_version` + models 名列表 + `account`（风控状态/解禁时间）（**只读内存缓存**，绝不发起网络探测；缓存由启动探测与后台刷新线程维护，保证 GUI 1.5s 超时内返回） |
 
 模型映射：上游存在的 ID 直通；`claude-*` 前缀按 config models 映射（默认 opus→glm-5.3、sonnet/haiku→deepseek-flash）；兜底 default_model。
 
@@ -163,7 +171,7 @@ Rust `proxy_usage(range)` 只读该库并校验 `usage_daily` 列结构，数据
 - `custom-protocol` 是 release 必需项：tauri build.rs 以 `dev = !has_feature("custom-protocol")` 判定模式，缺它则不嵌入 `frontendDist`，WebView 改连 `devUrl`（127.0.0.1:5177），vite 未启动即 `chrome-error://chromewebdata/` 白屏；Vite 另需 `base: "./"`。
 - `[lib]` 只留 `rlib`（cdylib 超 MinGW ld 65535 符号上限）。
 - 单测：`cargo test --manifest-path src-tauri\Cargo.toml --lib --no-default-features`（含 Rust usage 只读查询；gui 层不进测试二进制）。
-- Python 自检三合一（不访问真实上游）：`"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage`（`usage_storage_selftest` schema/v1 迁移/WAL/聚合/失败/并发；`resilience_selftest` 10053 捕获/健康检查零阻塞/别名过滤；`model_catalog_selftest` 两处合并/展示名/服务端优先。本机 PATH 的 `python` 是 Windows Store alias，不可用）。
+- Python 自检四合一（不访问真实上游）：`"%APPDATA%\LobsterAI\runtimes\python-win\python.exe" src-tauri\proxy\lobster_proxy.py --selftest-storage`（`usage_storage_selftest` schema/v1 迁移/WAL/聚合/失败/并发；`resilience_selftest` 10053 捕获/健康检查零阻塞/别名过滤；`model_catalog_selftest` 两处合并/展示名/服务端优先；`account_guard_selftest` 账号限制识别/熔断零请求/过期解禁。本机 PATH 的 `python` 是 Windows Store alias，不可用）。
 - 发布：`npx tauri build --target x86_64-pc-windows-gnu`（需 NSIS）→ `bundle\nsis\LobsterPlus_<版本>_x64-setup.exe`。**只能发安装包**：exe 依赖同目录 `WebView2Loader.dll`，裸发会在未装 WebView2 运行时的机器上启动失败（v0.2.0 教训）。
 - 版本号需同步五处：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/proxy/lobster_proxy.py` 的 `PROXY_SCRIPT_VERSION`。最后一项必须等于 `CARGO_PKG_VERSION`，否则 `proxy::start()` 每次都误判 stale 并多一次无谓重启——`proxy::tests::embedded_script_version_matches_crate_version` 会在不一致时让单测失败。
 
